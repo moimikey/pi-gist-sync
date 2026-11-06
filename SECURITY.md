@@ -1,0 +1,43 @@
+# Security policy
+
+## Reporting a vulnerability
+
+Report privately through GitHub private vulnerability reporting:
+<https://github.com/moimikey/pi-gist-sync/security/advisories/new>
+
+Do not open a public issue or paste a gist ID, token or passphrase anywhere public. Include the version, the command you ran and what you expected. Please give me reasonable time to ship a fix before you disclose.
+
+## Supported versions
+
+| Version | Supported |
+|---|---|
+| Latest 0.x release | Yes |
+| Anything older | No, upgrade first |
+
+## Threat model
+
+pi-gist-sync copies files between your Pi agent dir and one GitHub Gist. Pi extensions are code, and Pi follows skills and instruction files without asking, so whoever can write to the gist can try to get code or instructions onto your machine. That shapes most of the design.
+
+| Threat | Mitigation | Residual risk |
+|---|---|---|
+| Someone reads your gist | Gists are created secret, and a push to a public gist is refused. Secret means unlisted, not private: anyone with the URL can read it. Credential files (at any depth, any letter case) and files the secret scanner flags are skipped by default. | The scanner is pattern-based and best effort: it can miss a secret that is split, encoded or in an unknown format. Treat the gist as readable by anyone who learns the link. Paths, sizes, modes, the host name and timestamps are always readable. |
+| Credentials leak through the gist | `credentials: "encrypt"` encrypts credential files and scanner-flagged files with AES-256-GCM, with a key derived from your passphrase by scrypt (N=2^17, r=8, p=1, random salt) and split by HKDF into encryption and MAC keys. The path is bound into each ciphertext and digest. | A weak passphrase can be attacked offline by anyone who has the gist. A lost passphrase cannot be recovered. Backups in `gist-sync-backups/` hold whatever the old file held and are never pruned. |
+| Someone with write access to the gist (for example a stolen token) tries to run code or plant instructions on your machines | A pull asks for approval before it applies anything except `keybindings.json`, `themes/**` and display-only `settings.json` keys. That covers `extensions/**`, `mcp.json`, `models.json`, `skills/**`, `agents/**`, `prompts/**`, instruction files, every other `settings.json` key and all other files. The prompt shows each path, the changed settings keys and a SHA-256 of the content. `--yes` skips it, and with no UI and no `--yes` the pull aborts. Pi's own `trust.json`, `oauth.json` and `crashes.json` are never synced. | If you confirm, or pass `--yes`, you accept that content. Review the list and compare the hashes first, or run `pull --dry-run`. Without a passphrase nothing authenticates the manifest, so the prompt is the only control and a careless yes defeats it. |
+| A forged or replayed manifest | With a passphrase, the whole manifest is signed (HMAC-SHA256, bound to the gist ID) and checked before anything else, so a writer without the passphrase cannot change paths, modes, gist names or digests. After one verified sync a machine refuses an unsigned or unverifiable manifest. A manifest with a lower revision than the last sync is refused unless forced. | Without a passphrase there is no signature. A machine that has never verified the gist cannot tell a stripped signature from an unsigned gist (first contact). A writer can raise the revision number, so the rollback check only catches accidents and naive replays. |
+| A remote edit widens trust or swaps the updater | The `settings.json` keys `defaultProjectTrust`, `selfUpdateCommand`, `npmCommand`, `shellPath`, `httpProxy`, `sessionDir`, `lastChangelogVersion`, `extensionChangelogVersions`, `deviceId` and `trackingId` are never pushed and are preserved from the local file on pull, including when the file has a BOM. An unparseable `settings.json` is never pushed, and an unparseable one in the gist fails the pull. | Other settings do sync, and the ones that can run code or load paths need approval. |
+| A malicious manifest writes outside the agent dir | Every manifest path is rejected if it is absolute, empty, contains an empty, `.` or `..` segment, a backslash, a NUL byte, a control or invisible character, a colon, a drive letter, a trailing slash, dot or space, a Windows device name, or exceeds 32 levels, 1024 bytes in total or 255 in one part. The resolved target must stay inside the agent dir, which skips symlinked parent directories. Written files lose group and world write bits and setuid bits. | A filesystem whose case or Unicode folding differs from what is checked here could still map two names to one file. |
+| A hostile manifest wedges Pi | Paths, depth, entry count (300), digests and gist names are bounded and checked in linear time before any filesystem work. An entry that cannot be inspected (a directory in the way, a parent that is a file) is skipped instead of failing every sync. Downloads over 64 MiB per file are refused. | A manifest that is not valid at all makes the gist unusable until you repair it on GitHub or link a new one. |
+| A tampered or corrupted gist file is applied | The digest of every file a pull will write is verified after decoding, and all of them before any is written. A mismatch fails the pull with nothing written. GCM authentication catches tampering with encrypted files, and an encrypted entry cannot be moved to another path. | Plain digests are unkeyed, so without a passphrase a writer can recompute them. The approval gate covers that case. |
+| Linking someone else's gist | `init <id>` compares the gist owner with your token's account and asks before linking another account's gist. | If you confirm a foreign gist, its owner controls what you pull from it (the approval gate still applies). |
+| Two machines push at the same moment and one update is lost | A push re-reads the gist right before it writes and aborts with a conflict error when the manifest revision or the gist's update time changed. | A gist has no conditional write, so a push that lands between that re-read and the write can still be overwritten. The losing machine's file is then missing from the manifest and its next sync does not re-upload it. Push from one machine at a time. |
+| A pull destroys local work | Every file a pull overwrites or deletes is copied to `gist-sync-backups/` first, including a file that appeared while the prompt was open. Remote deletions apply only with `--prune`. Files are written through a temp file that is synced to disk before it replaces the old one. | Backups live on the same disk and hold whatever the old file held, including secrets. |
+| Token disclosure | The token is read from an environment variable or `gh auth token`. It is sent only to the API host and `gist.githubusercontent.com`, and it is kept out of error messages and notifications. | Anything else on your machine that can read your environment can read the token. |
+| Config and state tamper locally | `gist-sync.json` and `gist-sync.state.json` are written with mode 0600 through a temp file and rename. | An attacker with write access to your agent dir already controls Pi. |
+
+## Out of scope
+
+| Item | Why |
+|---|---|
+| A compromised machine or GitHub account | Local code execution and account takeover are outside what a sync tool can defend against. |
+| Content you choose to sync | You can add files to `include` and remove them from `exclude`. What those files contain is your responsibility. |
+| Vulnerabilities in Pi or in packages you install | Report them to their maintainers. |

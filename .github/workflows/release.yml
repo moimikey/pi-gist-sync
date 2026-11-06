@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs with no secrets and no publish rights, so a hostile dev dependency has nothing to steal.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned by commit SHA because a tag can be moved after review.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          # A release job must not restore a cache an earlier PR run could have written.
+          package-manager-cache: false
+      - name: Check the tag is on main and matches package.json
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF_NAME is not on main" >&2
+            exit 1
+          fi
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(jq -r .version package.json)"
+          if [ "$tag" != "$pkg" ]; then
+            echo "Tag $GITHUB_REF_NAME != package.json $pkg" >&2
+            exit 1
+          fi
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    # id-token is required for npm provenance
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      # The package ships source, so publishing needs no install and no build.
+      - name: Publish (a prerelease tag such as v0.2.0-rc.1 goes to the next dist-tag)
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
+          esac
+          npm publish --provenance --access public --tag "$dist_tag"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
