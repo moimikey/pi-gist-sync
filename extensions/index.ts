@@ -1,6 +1,6 @@
 // Thin glue between Pi's extension API and the testable command layer in src/command.ts.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { runCommand, startupCheck, SUBCOMMAND_SUMMARY, SUBCOMMANDS } from "../src/command.ts";
+import { argumentCompletions, configuredRootNames, runCommand, startupCheck, wantsRootNames } from "../src/command.ts";
 import type { CommandIO } from "../src/command.ts";
 
 const EXEC_TIMEOUT_MS = 15_000;
@@ -21,17 +21,10 @@ function makeIO(pi: ExtensionAPI, ctx: ExtensionContext, reload: () => Promise<v
 
 export default function (pi: ExtensionAPI): void {
   pi.registerCommand("gist-sync", {
-    description: "Sync your Pi setup through a secret GitHub Gist (init, status, push, pull, scan, unlink)",
-    getArgumentCompletions: (prefix) => {
-      if (/\s/.test(prefix.trimStart())) return null;
-      const typed = prefix.trim().toLowerCase();
-      const items = SUBCOMMANDS.filter((s) => s.startsWith(typed)).map((s) => ({
-        value: s,
-        label: s,
-        description: SUBCOMMAND_SUMMARY[s],
-      }));
-      return items.length > 0 ? items : null;
-    },
+    description: "Sync your Pi setup through a secret GitHub Gist (init, status, push, pull, scan, roots, unlink)",
+    // Only `roots remove` reads config, so every other completion stays synchronous.
+    getArgumentCompletions: (prefix) =>
+      wantsRootNames(prefix) ? configuredRootNames().then((names) => argumentCompletions(prefix, names)) : argumentCompletions(prefix),
     handler: (args, ctx) => runCommand(args, makeIO(pi, ctx, () => ctx.reload())),
   });
 

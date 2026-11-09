@@ -30,6 +30,8 @@ export const MAX_PATH_DEPTH = 32;
 
 // Control, invisible format, bidi and line-separator characters can spoof a prompt or hide a name.
 const INVISIBLE = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+// Spaces other than U+0020 and blank filler letters make a name look like another one in a prompt.
+const LOOKALIKE_BLANK = /[\p{Zs}\u115f\u1160\u3164\uffa0\u2800]/u;
 // Windows device names (with or without an extension) and stream or drive syntax.
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 
@@ -44,6 +46,7 @@ export function relPathProblem(path: unknown): string | undefined {
   if (path.endsWith("/")) return "trailing slash";
   if (Buffer.byteLength(path) > MAX_PATH_BYTES) return "path too long";
   if (INVISIBLE.test(path)) return "contains a control or invisible character";
+  if (LOOKALIKE_BLANK.test(path.replaceAll(" ", ""))) return "contains a non-ASCII space or blank character";
   const segments = path.split("/");
   if (segments.length > MAX_PATH_DEPTH) return "nested too deeply";
   for (const segment of segments) {

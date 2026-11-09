@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import {
   BACKUP_DIR,
+  CASE_INSENSITIVE_FS,
   clearState,
   CONFIG_FILE,
   CREDENTIAL_GLOBS,
@@ -13,8 +14,10 @@ import {
   DEFAULT_INCLUDE,
   isAlwaysExcluded,
   isCredentialPath,
+  isExcludedBy,
   loadConfig,
   loadState,
+  PORTABLE_EXCLUDE,
   resolveAgentDir,
   saveConfig,
   saveState,
@@ -77,6 +80,7 @@ test("defaultConfig has the spec defaults and returns fresh copies", () => {
   assert.equal(a.maxFileBytes, 1048576);
   assert.equal(a.checkOnStart, false);
   assert.equal("gistId" in a, false);
+  assert.deepEqual(a.roots, {});
   assert.deepEqual(a.include, [...DEFAULT_INCLUDE]);
   assert.deepEqual(a.exclude, [...DEFAULT_EXCLUDE]);
 
@@ -278,4 +282,164 @@ test("resolveAgentDir expands a leading ~ in PI_CODING_AGENT_DIR", () => {
 test("resolveAgentDir leaves a non-leading or user-form ~ alone", () => {
   assert.equal(resolveAgentDir({ HOME: "/h", PI_CODING_AGENT_DIR: "/a/~/b" }), "/a/~/b");
   assert.equal(resolveAgentDir({ HOME: "/h", PI_CODING_AGENT_DIR: "~other/x" }), "~other/x");
+});
+
+// ---- roots and the new defaults --------------------------------------------
+
+test("PORTABLE_EXCLUDE is the non agent-dir part of DEFAULT_EXCLUDE", () => {
+  assert.deepEqual([...PORTABLE_EXCLUDE], [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/.DS_Store",
+    "**/*.bak",
+    "**/*.bak-*",
+    "**/*.log",
+    "**/*.jsonl",
+    "**/*.tmp",
+    "**/__pycache__/**",
+    "**/.ruff_cache/**",
+  ]);
+  for (const g of PORTABLE_EXCLUDE) assert.ok(DEFAULT_EXCLUDE.includes(g), g);
+  assert.ok(Object.isFrozen(PORTABLE_EXCLUDE));
+  // Nothing tied to the agent dir layout leaks into the per-root list
+  for (const g of ["sessions/**", "*-cache.json", "bin/rg", "memory/daily/**"]) assert.equal(PORTABLE_EXCLUDE.includes(g), false, g);
+});
+
+test("default lists carry the roots-era additions", () => {
+  for (const g of ["bin/**", "*/settings.json"]) assert.ok(DEFAULT_INCLUDE.includes(g), g);
+  for (const g of [
+    "bin/fd", "bin/rg", "bin/fd.exe", "bin/rg.exe", "**/last-seen-version.json", "**/changelog-state.json",
+    "ayu/**", "pi-herdsman/**", "missions/**", "pi-warden/**", "pi-sync/**", "pi-cache-optimizer-stats.d/**",
+    "pi-pretty/**", "memory/recovery/**", "memory/daily/**",
+  ]) {
+    assert.ok(DEFAULT_EXCLUDE.includes(g), g);
+  }
+  // memory stays opt-in
+  assert.equal(DEFAULT_INCLUDE.some((g) => g.startsWith("memory")), false);
+});
+
+test("an existing config keeps its own lists rather than the new defaults", async () => {
+  const dir = await tempDir();
+  await writeFile(join(dir, CONFIG_FILE), JSON.stringify({ include: ["settings.json"], exclude: ["sessions/**"] }));
+  const cfg = await loadConfig(dir);
+  assert.deepEqual(cfg.include, ["settings.json"]);
+  assert.deepEqual(cfg.exclude, ["sessions/**"]);
+  assert.deepEqual(cfg.roots, {});
+});
+
+test("roots round-trip through saveConfig and loadConfig", async () => {
+  const dir = await tempDir();
+  const cfg = {
+    ...defaultConfig(),
+    gistId: "g",
+    roots: {
+      "local-bin": { dir: "~/.local/bin", include: ["piwt", "wtw"], exclude: [] },
+      cfg: { dir: "/abs/config", include: ["**/*.toml"], exclude: ["secret/**"] },
+    },
+  };
+  await saveConfig(dir, cfg);
+  assert.deepEqual(await loadConfig(dir), cfg);
+});
+
+test("saveConfig always writes roots and strips stray root fields", async () => {
+  const dir = await tempDir();
+  await saveConfig(dir, defaultConfig());
+  assert.deepEqual(JSON.parse(await readFile(join(dir, CONFIG_FILE), "utf8")).roots, {});
+
+  const stray = { dir: "/d", include: ["a"], exclude: [], extra: 1 } as never;
+  await saveConfig(dir, { ...defaultConfig(), roots: { r: stray } });
+  assert.deepEqual(JSON.parse(await readFile(join(dir, CONFIG_FILE), "utf8")).roots, { r: { dir: "/d", include: ["a"], exclude: [] } });
+});
+
+test("loadConfig drops malformed root entries one by one", async () => {
+  const dir = await tempDir();
+  await writeFile(
+    join(dir, CONFIG_FILE),
+    JSON.stringify({
+      roots: {
+        good: { dir: "/d", include: ["a"], exclude: ["b"] },
+        noexclude: { dir: "/d2", include: ["a"] },
+        empty: { dir: "/d3", include: [], exclude: [] },
+        str: "/d",
+        arr: ["/d"],
+        nulled: null,
+        baddir: { dir: 5, include: ["a"], exclude: [] },
+        noinclude: { dir: "/d" },
+        badinclude: { dir: "/d", include: "a", exclude: [] },
+        mixedinclude: { dir: "/d", include: ["a", 1], exclude: [] },
+        badexclude: { dir: "/d", include: ["a"], exclude: [null] },
+      },
+    }),
+  );
+  const cfg = await loadConfig(dir);
+  // Empty include is kept so resolveRoots can name the problem; a missing exclude means none
+  assert.deepEqual(cfg.roots, {
+    good: { dir: "/d", include: ["a"], exclude: ["b"] },
+    noexclude: { dir: "/d2", include: ["a"], exclude: [] },
+    empty: { dir: "/d3", include: [], exclude: [] },
+  });
+
+  for (const bad of ["x", 1, null, [], true]) {
+    await writeFile(join(dir, CONFIG_FILE), JSON.stringify({ roots: bad }));
+    assert.deepEqual((await loadConfig(dir)).roots, {}, JSON.stringify(bad));
+  }
+});
+
+test("a __proto__ root name stays an own key and never touches the prototype", async () => {
+  const dir = await tempDir();
+  await writeFile(
+    join(dir, CONFIG_FILE),
+    '{"roots":{"__proto__":{"dir":"/evil","include":["**"],"exclude":[]},"ok":{"dir":"/d","include":["a"],"exclude":[]}}}',
+  );
+  const cfg = await loadConfig(dir);
+  assert.equal(Object.getPrototypeOf(cfg.roots), Object.prototype);
+  assert.deepEqual(Object.keys(cfg.roots).sort(), ["__proto__", "ok"]);
+  assert.equal(({} as Record<string, unknown>).dir, undefined);
+
+  // And it survives a save as data too
+  await saveConfig(dir, cfg);
+  const text = await readFile(join(dir, CONFIG_FILE), "utf8");
+  assert.match(text, /"__proto__"/);
+  const again = await loadConfig(dir);
+  assert.deepEqual(Object.keys(again.roots).sort(), ["__proto__", "ok"]);
+  assert.equal(Object.getPrototypeOf(again.roots), Object.prototype);
+});
+
+test("isAlwaysExcluded also guards root-relative paths", () => {
+  for (const p of ["gist-sync.json", "node_modules/x", "a/.git/HEAD", "trust.json"]) assert.equal(isAlwaysExcluded(p), true, p);
+  assert.equal(isAlwaysExcluded("piwt"), false);
+});
+
+test("credential globs cover common stores a root can reach", () => {
+  for (const p of [
+    ".netrc",
+    "_netrc",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    "docker/config.json",
+    ".docker/config.json",
+    "kube/config",
+    ".kube/config",
+    "certs/server.pem",
+    "certs/server.pem.key",
+    "x/client.P12",
+    "a.pfx",
+    "id_rsa",
+    "ssh/id_ed25519.pub",
+    "gh/hosts.yml",
+  ]) {
+    assert.equal(isCredentialPath(p), true, p);
+  }
+  for (const p of ["keybindings.json", "docker/compose.yml", "kube/notes.md", "bin/piwt", "key.txt"]) assert.equal(isCredentialPath(p), false, p);
+});
+
+test("isExcludedBy folds case on both sides when asked, and only then", () => {
+  assert.equal(isExcludedBy(["bin/rg", "private/**"], "bin/RG", true), true);
+  assert.equal(isExcludedBy(["Private/**"], "PRIVATE/planted", true), true);
+  assert.equal(isExcludedBy(["bin/rg"], "bin/RG", false), false);
+  assert.equal(isExcludedBy(["bin/rg"], "bin/rg", false), true);
+  assert.equal(isExcludedBy(["bin/rg"], "bin/rgx", true), false);
+  assert.equal(CASE_INSENSITIVE_FS, process.platform === "darwin" || process.platform === "win32");
 });

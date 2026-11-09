@@ -22,6 +22,9 @@ const PREFIXED_RULES: readonly Rule[] = [
   { label: "groq-key", re: /(?<![A-Za-z0-9_])gsk_[A-Za-z0-9]{40,}/ },
   { label: "huggingface-token", re: /(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{34,}/ },
   { label: "google-oauth-secret", re: /GOCSPX-[A-Za-z0-9_-]{20,}/ },
+  // base64 of "-----BEGIN", as in kubeconfig client-key-data
+  { label: "private-key", re: /LS0tLS1CRUdJTi/ },
+  { label: "netrc-password", re: /(?:^|\s)machine[ \t]+\S{1,253}\s+(?:login[ \t]+\S{1,200}\s+)?password[ \t]+\S{1,200}/ },
   { label: "jwt", re: /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/ },
   { label: "url-password", re: /[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:@/]{1,100}:[^\s:@/]{3,100}@[^\s/]{1,200}/i },
 ];
@@ -34,6 +37,13 @@ const UNQUOTED = new RegExp(
   "gi",
 );
 const BEARER = /bearer[ \t]+([A-Za-z0-9._~+/=-]{20,300})/gi;
+// Docker and npm keep base64 "user:password" in an "auth" field.
+const BASIC_AUTH = /"auth"[ \t]{0,8}:[ \t]{0,8}"([A-Za-z0-9+/]{8,400}={0,2})"/g;
+
+function isUserPassword(value: string): boolean {
+  const decoded = Buffer.from(value, "base64").toString("utf8");
+  return /^[^:\s]{1,200}:\S{1,200}$/.test(decoded);
+}
 
 const PLACEHOLDER = /your|example|placeholder|changeme|change-me|redacted|dummy|sample|insert|replace|todo|xxxx|\*{4}|[<>]|\$\{|\{\{|process\.env|env\./i;
 // `$VAR`, `%VAR%` and Pi's `!command` values reference a secret instead of holding one.
@@ -78,6 +88,7 @@ function scanText(text: string, labels: Set<string>): void {
   for (const rule of PREFIXED_RULES) if (rule.re.test(text)) labels.add(rule.label);
   // Short or digit-free quoted values are usually words, so they need more length to count.
   if (anyMatch(text, BEARER, (v) => hasDigit(v) && hasLetter(v))) labels.add("bearer-token");
+  if (anyMatch(text, BASIC_AUTH, isUserPassword)) labels.add("basic-auth");
   const generic =
     anyMatch(text, QUOTED, (v) => hasDigit(v) || v.length >= 16) ||
     anyMatch(text, UNQUOTED, (v) => hasDigit(v) && hasLetter(v));

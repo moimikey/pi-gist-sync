@@ -5,6 +5,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- Configurable roots for syncing selected files outside the agent dir under `@name/` paths. Root mappings stay local, and every pulled root file is approval-gated with its destination shown.
+- `/gist-sync roots [add <name> <dir> <glob...> | remove <name>]`. `roots add` refuses a catch-all include on `~/.config`, `~/.ssh`, `~/.aws`, `~/.kube`, `~/.docker` and `~/.gnupg`.
+- `status` and `pull` print a `roots add` hint for remote roots this machine has not configured.
+- Top-level `@` names in the agent dir are reserved for roots.
+- Default agent-dir patterns for `bin/**` and per-extension `*/settings.json`, plus exclusions for downloaded native binaries and per-machine/runtime files. New defaults apply to new configs only; an existing `gist-sync.json` keeps its lists.
+- Native executables (ELF, Mach-O, PE) are skipped by magic bytes in every scan and on pull.
+- Credential globs for `.netrc`, `.pgpass`, `.npmrc`, `.pypirc`, `.git-credentials`, Docker and kube configs, `*.pem`/`*.key`/`*.p12`/`*.pfx`, SSH keys and `gh/hosts.yml`, matched for a root file by its path under home too (so `config` in a root at `~/.kube` counts); scanner rules for base64 PEM keys, Docker `auth` fields and `.netrc` passwords.
+
+### Changed
+
+- The approval prompt lists every change in every tier; nothing is truncated. Agent-dir `bin/**` and any file with an execute bit are code tier; an executable `keybindings.json` or `themes/**` file loses its exemption and needs approval.
+- On macOS and Windows, exclude globs match case-insensitively.
+- A push that would take the gist past 300 files fails before any write.
+- Manifest paths with non-ASCII spaces or blank filler letters, or that differ only in Unicode normal form, are rejected.
+- `pull --dry-run` lists every change that needs approval, with each root file's destination.
+- A backup dir that already exists gets a random suffix instead of silently dropping the backup.
+
 ## [0.1.0] - 2026-11-05
 
 ### Added
@@ -24,7 +43,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Pi's own `trust.json`, `oauth.json` and `crashes.json` are never synced, and credential globs match at any depth and in any letter case.
 - Path checks on manifest paths (traversal, control and invisible characters, Windows device names, length, depth, entry count) and digest verification of every file to be written before any file is written. Pulled files lose group and world write bits and setuid bits, and credentials are written 0600.
 - Binary and whitespace-only files stored as base64, empty files recorded in the manifest only, and `/` in paths encoded so the flat gist namespace works.
-- The approval prompt always lists every code-tier change; the instruction and other tiers show their first 8 entries and a count.
 - `push` re-reads the gist right before writing and aborts with a conflict error if another push landed meanwhile. A gist has no conditional write, so this narrows the race but cannot close it.
 - Optional `checkOnStart` notification on Pi startup when the gist has changes you have not pulled; it never prompts and gives up after 5 s.
 - Token lookup from `PI_GIST_SYNC_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, then `gh auth token`.

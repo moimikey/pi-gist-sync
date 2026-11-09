@@ -35,7 +35,7 @@ node --test --experimental-strip-types test/<file>.test.ts
 | No dynamic `import()` in `src/` | jiti can hand a second concurrent `import()` of one module an undefined namespace, which broke back-to-back commands in Pi. |
 | A security fix ships with a test that fails without it | The approval gate, path rules and signature checks are the product. |
 | Tests use `node:test` and `node:assert/strict` | No test framework to install. |
-| Tests never touch your real `~/.pi` or the real GitHub API | Use `fs.mkdtemp` directories and the fake gist server in `test/helpers/fake-gist-server.ts`. |
+| Tests never touch your real `~/.pi`, home directory or the real GitHub API | Use `fs.mkdtemp` directories for both the agent dir and home, and the fake gist server in `test/helpers/fake-gist-server.ts`. |
 | Comments are one short line and explain why | Delete a comment that restates the code. |
 | Do not edit `src/types.ts` or the contract in `docs/SPEC.md` casually | Every module codes against them. Change both together and update every consumer. |
 
@@ -44,7 +44,7 @@ node --test --experimental-strip-types test/<file>.test.ts
 | Path | Role |
 |---|---|
 | `src/types.ts` | Shared types and `GistSyncError` |
-| `src/globs.ts`, `src/scan.ts`, `src/config.ts`, `src/settings-merge.ts` | Glob matching, agent dir scan, config and state files, `settings.json` handling |
+| `src/globs.ts`, `src/scan.ts`, `src/config.ts`, `src/roots.ts`, `src/settings-merge.ts` | Glob matching, agent dir and root scans, config and state files, root resolution, `settings.json` handling |
 | `src/codec.ts`, `src/secrets.ts`, `src/crypto.ts`, `src/manifest.ts` | Path and content encoding, secret detection, encryption, manifest parsing |
 | `src/gist-client.ts` | GitHub Gist API client and token resolution |
 | `src/plan.ts`, `src/sync.ts` | Three-way planner and the init, status, push and pull flows |

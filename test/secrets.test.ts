@@ -170,3 +170,19 @@ test("scans 1 MiB inputs quickly, including pathological ones", () => {
     assert.ok(ms < 2000, `${name} took ${ms.toFixed(0)} ms`);
   }
 });
+
+test("flags base64 PEM keys, docker auth and netrc passwords", () => {
+  const b64Pem = Buffer.from(PEM).toString("base64");
+  assert.deepEqual(scan(`users:\n- name: u\n  user:\n    client-key-data: ${b64Pem}\n`).includes("private-key"), true);
+  const auth = Buffer.from("alice:s3cretPassw0rd").toString("base64");
+  assert.ok(scan(`{"auths":{"ghcr.io":{"auth":"${auth}"}}}`).includes("basic-auth"));
+  assert.ok(scan("machine api.example.com\n  login alice\n  password hunter2hunter2\n").includes("netrc-password"));
+  assert.ok(scan("machine api.example.com login alice password hunter2\n").includes("netrc-password"));
+  for (const label of scan(`{"auth":"${auth}"}`)) assert.equal(label.includes("alice"), false);
+});
+
+test("an auth field that is not base64 user:password is left alone", () => {
+  assert.deepEqual(scan('{"auth":"required"}'), []);
+  assert.deepEqual(scan('{"auth":"oauth2-pkce-flow"}'), []);
+  assert.deepEqual(scan("Set a password in the machine settings.\n"), []);
+});

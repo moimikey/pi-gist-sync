@@ -1,9 +1,11 @@
 // Command layer: parses `/gist-sync ...`, wires the real environment into SyncApi, and maps every outcome to notify().
-import { readFile } from "node:fs/promises";
-import { hostname } from "node:os";
+import { readFile, realpath } from "node:fs/promises";
+import { homedir, hostname } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, resolveAgentDir } from "./config.ts";
+import { loadConfig, resolveAgentDir, saveConfig } from "./config.ts";
 import { createGistClient, resolveToken } from "./gist-client.ts";
+import { expandHome, ROOT_NAME, resolveRoots } from "./roots.ts";
 import { sync } from "./sync.ts";
 import type { GistClient, PullPlan, PullReview, ReviewTier, SyncApi, SyncConfig, SyncEnv } from "./types.ts";
 import { GistSyncError } from "./types.ts";
@@ -22,19 +24,69 @@ export type CommandDeps = Partial<{
   env: NodeJS.ProcessEnv;
   agentDir: string;
   client: GistClient;
+  /** Home dir for `~` in root dirs; tests pass a temp dir. */
+  home: string;
 }>;
 
-export const SUBCOMMANDS: readonly string[] = ["init", "status", "push", "pull", "scan", "unlink", "help"];
+export const SUBCOMMANDS: readonly string[] = ["init", "status", "push", "pull", "scan", "roots", "unlink", "help"];
 
 export const SUBCOMMAND_SUMMARY: Readonly<Record<string, string>> = {
   init: "Create a secret gist, or link an existing one: init [gist-id] [--yes]",
   status: "Compare this machine with the gist",
   push: "Upload local changes: push [--force] [--dry-run]",
   pull: "Apply gist changes locally: pull [--force] [--dry-run] [--prune] [--yes]",
-  scan: "List files under the agent dir that are not synced",
+  scan: "List files under the agent dir and roots that are not synced",
+  roots: "List, add or remove extra synced dirs: roots [add <name> <dir> <glob>... | remove <name>]",
   unlink: "Forget the linked gist (the gist and local files stay untouched)",
   help: "Show this help",
 };
+
+export interface Completion {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+const ROOTS_ACTIONS: Readonly<Record<string, string>> = {
+  add: "Add a root: roots add <name> <dir> <glob>...",
+  remove: "Remove a root from local config: roots remove <name>",
+};
+
+/** True when completing the name after `roots remove`, which needs the configured names. */
+export function wantsRootNames(prefix: string): boolean {
+  return /^\s*roots\s+remove\s+\S*$/i.test(prefix);
+}
+
+/** Pi replaces the whole argument text with `value`, so nested items carry the words before them. */
+export function argumentCompletions(prefix: string, rootNames: readonly string[] = []): Completion[] | null {
+  const words = prefix.trimStart().split(/\s+/);
+  let items: Completion[];
+  if (words.length === 1) {
+    const typed = words[0]!.toLowerCase();
+    items = SUBCOMMANDS.filter((s) => s.startsWith(typed)).map((s) => ({ value: s, label: s, description: SUBCOMMAND_SUMMARY[s] }));
+  } else if (words[0]!.toLowerCase() === "roots" && words.length === 2) {
+    const typed = words[1]!.toLowerCase();
+    items = Object.keys(ROOTS_ACTIONS)
+      .filter((a) => a.startsWith(typed))
+      .map((a) => ({ value: `roots ${a}`, label: a, description: ROOTS_ACTIONS[a] }));
+  } else if (wantsRootNames(prefix)) {
+    const typed = words[2] ?? "";
+    items = rootNames.filter((n) => n.startsWith(typed)).map((n) => ({ value: `roots remove ${n}`, label: n }));
+  } else {
+    return null;
+  }
+  return items.length > 0 ? items : null;
+}
+
+/** Configured root names for completion; empty when the config cannot be read. */
+export async function configuredRootNames(deps: CommandDeps = {}): Promise<string[]> {
+  try {
+    const config = await loadConfig(deps.agentDir ?? resolveAgentDir(deps.env ?? process.env));
+    return Object.keys(config.roots).sort();
+  } catch {
+    return [];
+  }
+}
 
 const ALLOWED_FLAGS: Readonly<Record<string, readonly string[]>> = {
   init: ["yes"],
@@ -46,6 +98,14 @@ const HELP = [
   "/gist-sync <command>",
   ...SUBCOMMANDS.map((s) => `  ${s.padEnd(7)} ${SUBCOMMAND_SUMMARY[s] ?? ""}`),
   "Token: PI_GIST_SYNC_TOKEN, GH_TOKEN, GITHUB_TOKEN, or `gh auth token` (needs the gist scope).",
+].join("\n");
+
+const ROOTS_USAGE = [
+  "Usage:",
+  "  /gist-sync roots                             list roots",
+  "  /gist-sync roots add <name> <dir> <glob>...  sync files under <dir> matching a glob as @<name>/...",
+  "  /gist-sync roots remove <name>               forget a root (the gist and local files stay untouched)",
+  "A name is lowercase letters, digits and dashes (up to 32). At least one include glob is required.",
 ].join("\n");
 
 const MAX_LISTED = 20;
@@ -83,6 +143,11 @@ function redact(text: string, secrets: readonly string[]): string {
 // Paths come from a remote manifest; strip escapes and bidi marks so they cannot spoof a prompt.
 function plain(text: string): string {
   return text.replace(/\r\n/g, "\n").replace(/[^\P{Cc}\n\t]|[\u202a-\u202e\u2066-\u2069]/gu, "?");
+}
+
+// One field of a prompt line: a newline here could forge a whole extra line.
+function oneLine(text: string): string {
+  return text.replace(/[\p{Cc}\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu, "?");
 }
 
 type Level = "info" | "warning" | "error";
@@ -172,6 +237,7 @@ async function resolvePassphrase(
 async function baseEnv(deps: CommandDeps, client: GistClient, passphrase?: string): Promise<SyncEnv> {
   return {
     agentDir: deps.agentDir ?? resolveAgentDir(deps.env ?? process.env),
+    home: deps.home ?? homedir(),
     client,
     passphrase,
     hostname: hostname(),
@@ -207,6 +273,8 @@ async function dispatch(args: string, io: CommandIO, deps: CommandDeps, secrets:
     say(HELP, "info");
     return;
   }
+  // Roots edit local config only: no token, no gist link, and their own argument shape.
+  if (sub === "roots") return runRoots(rest, flags, deps, say);
 
   const allowed = ALLOWED_FLAGS[sub] ?? [];
   const unknownFlags = [...flags].filter((f) => !allowed.includes(f));
@@ -283,10 +351,128 @@ async function runOffline(sub: "scan" | "unlink", deps: CommandDeps, say: Say): 
   const files = await api.scanCandidates(env);
   say(
     files.length === 0
-      ? "No unsynced files under the agent dir."
-      : [`${files.length} file(s) under the agent dir are not synced (edit include/exclude in gist-sync.json):`, ...listPaths(files, 100)].join("\n"),
+      ? "No unsynced files under the agent dir or roots."
+      : [
+          `${files.length} file(s) are not synced (edit include/exclude in gist-sync.json; @<name>/ paths belong to roots):`,
+          ...listPaths(files, 100),
+        ].join("\n"),
     "info",
   );
+}
+
+// ---- roots: local config only, never read from or written to the gist ----------
+
+async function runRoots(rest: readonly string[], flags: ReadonlySet<string>, deps: CommandDeps, say: Say): Promise<void> {
+  if (flags.size > 0) {
+    say(`Unknown flag ${[...flags].map((f) => `--${f}`).join(", ")} for "roots".\n${ROOTS_USAGE}`, "warning");
+    return;
+  }
+  const agentDir = deps.agentDir ?? resolveAgentDir(deps.env ?? process.env);
+  const ctx = { agentDir, home: deps.home ?? homedir() };
+  const [action, ...args] = rest;
+  if (action === undefined) return listRoots(ctx, say);
+  const verb = action.toLowerCase();
+  if (verb === "add") return addRoot(args, ctx, say);
+  if (verb === "remove") return removeRoot(args, ctx, say);
+  say(`Unknown roots action "${action}".\n${ROOTS_USAGE}`, "warning");
+}
+
+async function listRoots(ctx: { agentDir: string; home: string }, say: Say): Promise<void> {
+  const config = await loadConfig(ctx.agentDir);
+  const names = Object.keys(config.roots).sort();
+  if (names.length === 0) {
+    say("No roots configured. Add one with: /gist-sync roots add <name> <dir> <glob>...", "info");
+    return;
+  }
+  const { problems } = await resolveRoots(config, ctx);
+  const lines = [`${names.length} root(s):`];
+  for (const name of names) {
+    const root = config.roots[name]!;
+    const problem = problems.find((p) => p.name === name);
+    // A hand-edited config can hold a newline, which would forge a line of this list.
+    const parts = [`  ${oneLine(name)}  ${oneLine(root.dir)}  include: ${oneLine(root.include.join(", "))}`];
+    if (root.exclude.length > 0) parts.push(`exclude: ${oneLine(root.exclude.join(", "))}`);
+    parts.push(problem ? `ignored: ${oneLine(problem.message)}` : "ok");
+    lines.push(parts.join("  "));
+  }
+  say(lines.join("\n"), "info");
+}
+
+async function addRoot(args: readonly string[], ctx: { agentDir: string; home: string }, say: Say): Promise<void> {
+  const [name, dir, ...include] = args;
+  if (name === undefined || dir === undefined || include.length === 0) {
+    // No glob means no default: a root never syncs a whole dir by accident.
+    say(`roots add needs a name, a dir and at least one include glob.\n${ROOTS_USAGE}`, "warning");
+    return;
+  }
+  if (!ROOT_NAME.test(name)) {
+    say(`"${name}" is not a valid root name.\n${ROOTS_USAGE}`, "warning");
+    return;
+  }
+  const config = await loadConfig(ctx.agentDir);
+  if (Object.hasOwn(config.roots, name)) {
+    say(`Root "${name}" already exists. Remove it first: /gist-sync roots remove ${name}`, "warning");
+    return;
+  }
+  const next = { ...config, roots: { ...config.roots, [name]: { dir, include, exclude: [] } } };
+  const before = new Set((await resolveRoots(config, ctx)).problems.map((p) => p.name));
+  const { problems } = await resolveRoots(next, ctx);
+  // Overlap drops the later name, so the new root can also knock out one that worked before.
+  const caused = problems.filter((p) => p.name === name || !before.has(p.name));
+  if (caused.length > 0) {
+    const why = caused.map((p) => (p.name === name ? p.message : `root "${p.name}" would break: ${p.message}`));
+    say(`Root "${name}" not added: ${why.join("; ")}`, "warning");
+    return;
+  }
+  const broad = await credentialStoreCatchAll(dir, include, ctx.home);
+  if (broad !== undefined) {
+    say(`Root "${name}" not added: ${broad} holds credentials, so a catch-all include (${include.join(", ")}) is refused. Name the files instead.`, "warning");
+    return;
+  }
+  await saveConfig(ctx.agentDir, next);
+  say(`Root "${name}" added: ${dir} (${include.length} include glob(s)). Everything under a root needs approval on pull.`, "info");
+}
+
+// Dirs under ~ that mostly hold keys and tokens; a catch-all root there would push every new one.
+const CREDENTIAL_STORES: readonly string[] = [".config", ".ssh", ".aws", ".kube", ".docker", ".gnupg"];
+
+function isCatchAll(glob: string): boolean {
+  const first = glob.split("/")[0];
+  return first === "*" || first === "**";
+}
+
+async function realOrSelf(p: string): Promise<string> {
+  try {
+    return await realpath(p);
+  } catch {
+    return p;
+  }
+}
+
+/** The `~/...` name of the credential store `dir` is, when any include glob is a catch-all. */
+async function credentialStoreCatchAll(dir: string, include: readonly string[], home: string): Promise<string | undefined> {
+  if (!include.some(isCatchAll)) return undefined;
+  const real = (await realOrSelf(expandHome(dir, home))).toLowerCase();
+  for (const store of CREDENTIAL_STORES) {
+    if ((await realOrSelf(join(home, store))).toLowerCase() === real) return `~/${store}`;
+  }
+  return undefined;
+}
+
+async function removeRoot(args: readonly string[], ctx: { agentDir: string; home: string }, say: Say): Promise<void> {
+  if (args.length !== 1) {
+    say(`roots remove takes exactly one name.\n${ROOTS_USAGE}`, "warning");
+    return;
+  }
+  const name = args[0]!;
+  const config = await loadConfig(ctx.agentDir);
+  if (!Object.hasOwn(config.roots, name)) {
+    say(`No root named "${name}".`, "warning");
+    return;
+  }
+  const roots = Object.fromEntries(Object.entries(config.roots).filter(([n]) => n !== name));
+  await saveConfig(ctx.agentDir, { ...config, roots });
+  say(`Root "${name}" removed from gist-sync.json. The gist and local files were not touched.`, "info");
 }
 
 async function runSynced(
@@ -344,15 +530,21 @@ const TIER_TITLES: Readonly<Record<ReviewTier, string>> = {
   instructions: "Instructions and skills that steer the model",
   other: "Other files",
 };
-const REVIEW_PER_TIER = 8;
 
 function formatSize(bytes: number): string {
   return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
 }
 
+// Root files may land on PATH, so a look-alike letter in their name is shown as an escape.
+function ascii(text: string): string {
+  return oneLine(text).replace(/[^\x20-\x7e]/gu, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
+}
+
 function reviewLine(r: PullReview): string {
-  const parts = [`${r.action} ${r.path}`];
-  if (r.keys && r.keys.length > 0) parts.push(`keys: ${r.keys.join(", ")}`);
+  // A root file names where it lands, since that dir may be on PATH.
+  const target = r.dest !== undefined ? `${ascii(r.path)} -> ${ascii(r.dest)}` : oneLine(r.path);
+  const parts = [`${r.action} ${target}`];
+  if (r.keys && r.keys.length > 0) parts.push(`keys: ${oneLine(r.keys.join(", "))}`);
   if (r.sha256 !== undefined) parts.push(`sha256:${r.sha256.slice(0, 12)} ${formatSize(r.size ?? 0)}`);
   return `  ${parts.join("  ")}`;
 }
@@ -363,10 +555,8 @@ export function describeReview(review: readonly PullReview[]): string {
   for (const tier of ["code", "instructions", "other"] as const) {
     const group = review.filter((r) => r.tier === tier);
     if (group.length === 0) continue;
-    // Code Pi runs is never truncated: approving it unseen is the risk this prompt exists to prevent.
-    const shown = tier === "code" ? group : group.slice(0, REVIEW_PER_TIER);
-    lines.push(`${TIER_TITLES[tier]} (${group.length})`, ...shown.map(reviewLine));
-    if (shown.length < group.length) lines.push(`  ...and ${group.length - shown.length} more`);
+    // Never truncated: a file approved unseen is the risk this prompt exists to prevent, and a gist caps it at 300.
+    lines.push(`${TIER_TITLES[tier]} (${group.length})`, ...group.map(reviewLine));
   }
   return lines.join("\n");
 }

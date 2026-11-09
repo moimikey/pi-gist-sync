@@ -2,8 +2,9 @@ import { constants, type Dirent } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { relPathProblem } from "./codec.ts";
-import { isAlwaysExcluded, isCredentialPath } from "./config.ts";
+import { CASE_INSENSITIVE_FS, isAlwaysExcluded, isExcludedBy, PORTABLE_EXCLUDE } from "./config.ts";
 import { matchesAny, matchGlob } from "./globs.ts";
+import { isRootCredential, joinRootPath, ROOT_PREFIX, type ResolvedRoot } from "./roots.ts";
 import type { ScannedFile, SkippedFile, SyncConfig } from "./types.ts";
 
 // Stand-in child name to ask "could any file under this dir match?" of a glob list.
@@ -12,7 +13,8 @@ const PROBE = "x";
 // Missing on Windows, where there is no symlink race to close.
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 
-type EntryKind = "file" | "symlink" | "other";
+// "reserved": a top-level agent-dir entry starting with ROOT_PREFIX, which the gist uses for roots.
+type EntryKind = "file" | "symlink" | "other" | "reserved";
 
 interface Found {
   path: string;
@@ -22,6 +24,18 @@ interface Found {
 interface DirFailure {
   path: string;
   detail: string;
+}
+
+interface TreeOptions {
+  include: readonly string[];
+  exclude: readonly string[];
+  maxFileBytes: number;
+  /** Prepended to every reported path; "" for the agent dir. */
+  prefix: string;
+  /** Skip top-level names starting with ROOT_PREFIX (agent dir only). */
+  reserveRootPrefix: boolean;
+  /** Where the tree sits under home, for credential globs that name a dir; "" for the agent dir. */
+  credPrefix: string;
 }
 
 // Code-unit order, not locale order, so output is identical on every machine.
@@ -42,11 +56,29 @@ function kindOf(entry: Dirent): EntryKind {
 // `X/**` excludes every descendant of any dir matching X, so such a dir is never worth entering.
 function isPrunedDir(rel: string, exclude: readonly string[]): boolean {
   if (isAlwaysExcluded(rel)) return true;
-  for (const glob of exclude) {
+  const path = CASE_INSENSITIVE_FS ? rel.toLowerCase() : rel;
+  for (const raw of exclude) {
+    const glob = CASE_INSENSITIVE_FS ? raw.toLowerCase() : raw;
     if (glob === "**") return true;
-    if (glob.endsWith("/**") && matchGlob(glob.slice(0, -3), rel)) return true;
+    if (glob.endsWith("/**") && matchGlob(glob.slice(0, -3), path)) return true;
   }
   return false;
+}
+
+/** False only when no file below `dir` can match `glob`; braces may hide a `/`, so they count as a maybe. */
+function globReachesBelow(glob: string, dir: string): boolean {
+  if (glob.includes("{")) return true;
+  const parts = glob.split("/");
+  const segs = dir.split("/");
+  for (const [i, seg] of segs.entries()) {
+    const part = parts[i];
+    if (part === undefined) return false;
+    if (part.includes("**")) return true;
+    // The glob ends at this depth, so it can only name `dir` itself.
+    if (i === parts.length - 1) return false;
+    if (!matchGlob(part, seg)) return false;
+  }
+  return true;
 }
 
 function couldBeIncluded(rel: string, include: readonly string[]): boolean {
@@ -62,8 +94,11 @@ function isNotFound(err: unknown): boolean {
 }
 
 async function walk(
-  agentDir: string,
-  config: SyncConfig,
+  baseDir: string,
+  exclude: readonly string[],
+  reserveRootPrefix: boolean,
+  /** When set, dirs no include glob can reach are not entered, so a narrow root never walks a huge tree. */
+  include?: readonly string[],
 ): Promise<{ found: Found[]; dirFailures: DirFailure[] }> {
   const found: Found[] = [];
   const dirFailures: DirFailure[] = [];
@@ -71,10 +106,10 @@ async function walk(
   async function visit(rel: string): Promise<void> {
     let entries;
     try {
-      entries = await readdir(rel === "" ? agentDir : join(agentDir, ...rel.split("/")), { withFileTypes: true });
+      entries = await readdir(rel === "" ? baseDir : join(baseDir, ...rel.split("/")), { withFileTypes: true });
     } catch (err) {
       if (rel === "") {
-        // A missing agent dir just means nothing to sync yet
+        // A missing base dir just means nothing to sync yet
         if (isNotFound(err)) return;
         throw err;
       }
@@ -86,9 +121,17 @@ async function walk(
     for (const entry of entries) {
       const path = rel === "" ? entry.name : `${rel}/${entry.name}`;
       if (entry.isDirectory()) {
-        if (!isPrunedDir(path, config.exclude)) await visit(path);
-      } else if (isAlwaysExcluded(path) || matchesAny(config.exclude, path)) {
+        if (isPrunedDir(path, exclude)) continue;
+        if (include && !include.some((g) => globReachesBelow(g, path))) continue;
+        if (reserveRootPrefix && rel === "" && entry.name.startsWith(ROOT_PREFIX)) {
+          found.push({ path, kind: "reserved" });
+        } else {
+          await visit(path);
+        }
+      } else if (isAlwaysExcluded(path) || isExcludedBy(exclude, path)) {
         continue;
+      } else if (reserveRootPrefix && rel === "" && entry.name.startsWith(ROOT_PREFIX)) {
+        found.push({ path, kind: "reserved" });
       } else {
         found.push({ path, kind: kindOf(entry) });
       }
@@ -121,28 +164,56 @@ async function readFileCapped(
   }
 }
 
-export async function scanAgentDir(
-  agentDir: string,
-  config: SyncConfig,
+// Native executables are per-platform builds, so syncing them across machines would install the wrong binary.
+const MACHO_MAGICS: ReadonlySet<number> = new Set([
+  0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xbebafeca, 0xcafebabf, 0xbfbafeca,
+]);
+// CAFEBABE is also a Java class; its next word is a class version (45+), a fat Mach-O's is a small arch count.
+const MAX_FAT_ARCHS = 30;
+
+/** ELF, Mach-O (thin or fat) or PE by magic bytes; a PE needs `PE\0\0` at e_lfanew so an "MZ..." text file is not one. */
+export function isNativeBinary(bytes: Uint8Array): boolean {
+  if (bytes.length < 4) return false;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const magic = view.getUint32(0, false);
+  if (magic === 0x7f454c46 || MACHO_MAGICS.has(magic)) return true;
+  if (magic === 0xcafebabe) return bytes.length >= 8 && view.getUint32(4, false) < MAX_FAT_ARCHS;
+  if (bytes[0] !== 0x4d || bytes[1] !== 0x5a || bytes.length < 0x40) return false;
+  const peOffset = view.getUint32(0x3c, true);
+  if (peOffset + 4 > bytes.length) return false;
+  return view.getUint32(peOffset, false) === 0x50450000;
+}
+
+async function scanTree(
+  baseDir: string,
+  opts: TreeOptions,
   detect: (bytes: Uint8Array, path: string) => string[],
 ): Promise<{ files: ScannedFile[]; skipped: SkippedFile[] }> {
-  const { found, dirFailures } = await walk(agentDir, config);
+  const { found, dirFailures } = await walk(baseDir, opts.exclude, opts.reserveRootPrefix, opts.include);
   const files: ScannedFile[] = [];
   const skipped: SkippedFile[] = [];
+  const out = (rel: string): string => opts.prefix + rel;
 
   // Only unreadable dirs that could hold synced files are worth a warning
   for (const f of dirFailures) {
-    if (couldBeIncluded(f.path, config.include)) {
-      skipped.push({ path: f.path, reason: "unreadable", detail: f.detail });
+    if (couldBeIncluded(f.path, opts.include)) {
+      skipped.push({ path: out(f.path), reason: "unreadable", detail: f.detail });
     }
   }
 
-  for (const { path, kind } of found) {
+  for (const { path: rel, kind } of found) {
+    const path = out(rel);
     if (kind === "symlink") {
-      if (couldBeIncluded(path, config.include)) skipped.push({ path, reason: "symlink" });
+      if (couldBeIncluded(rel, opts.include)) skipped.push({ path, reason: "symlink" });
       continue;
     }
-    if (!matchesAny(config.include, path)) continue;
+    if (kind === "reserved") {
+      if (couldBeIncluded(rel, opts.include)) {
+        skipped.push({ path, reason: "unreadable", detail: `the "${ROOT_PREFIX}" prefix is reserved for roots` });
+      }
+      continue;
+    }
+    if (!matchesAny(opts.include, rel)) continue;
     if (kind === "other") {
       skipped.push({ path, reason: "unreadable", detail: "not a regular file" });
       continue;
@@ -156,7 +227,7 @@ export async function scanAgentDir(
 
     let read;
     try {
-      read = await readFileCapped(join(agentDir, ...path.split("/")), config.maxFileBytes);
+      read = await readFileCapped(join(baseDir, ...rel.split("/")), opts.maxFileBytes);
     } catch (err) {
       if (!isNotFound(err)) skipped.push({ path, reason: "unreadable", detail: errMessage(err) });
       continue;
@@ -165,8 +236,12 @@ export async function scanAgentDir(
       skipped.push({
         path,
         reason: "too-large",
-        detail: `${read.tooLarge} bytes exceeds maxFileBytes ${config.maxFileBytes}`,
+        detail: `${read.tooLarge} bytes exceeds maxFileBytes ${opts.maxFileBytes}`,
       });
+      continue;
+    }
+    if (isNativeBinary(read.bytes)) {
+      skipped.push({ path, reason: "native-binary" });
       continue;
     }
 
@@ -175,7 +250,7 @@ export async function scanAgentDir(
       size: read.bytes.length,
       mode: read.mode,
       bytes: read.bytes,
-      sensitive: isCredentialPath(path) || detect(read.bytes, path).length > 0,
+      sensitive: isRootCredential(opts, rel) || detect(read.bytes, rel).length > 0,
     });
   }
 
@@ -184,11 +259,56 @@ export async function scanAgentDir(
   return { files, skipped };
 }
 
+export async function scanAgentDir(
+  agentDir: string,
+  config: SyncConfig,
+  detect: (bytes: Uint8Array, path: string) => string[],
+): Promise<{ files: ScannedFile[]; skipped: SkippedFile[] }> {
+  return scanTree(
+    agentDir,
+    { include: config.include, exclude: config.exclude, maxFileBytes: config.maxFileBytes, prefix: "", reserveRootPrefix: true, credPrefix: "" },
+    detect,
+  );
+}
+
+function rootExclude(root: ResolvedRoot): string[] {
+  return [...PORTABLE_EXCLUDE, ...root.exclude];
+}
+
+/** Scans a resolved root; every reported path is `@name/rel`, while `detect` gets the root-relative path. */
+export async function scanRoot(
+  root: ResolvedRoot,
+  config: SyncConfig,
+  detect: (bytes: Uint8Array, path: string) => string[],
+): Promise<{ files: ScannedFile[]; skipped: SkippedFile[] }> {
+  return scanTree(
+    root.dir,
+    {
+      include: root.include,
+      exclude: rootExclude(root),
+      maxFileBytes: config.maxFileBytes,
+      prefix: joinRootPath(root.name, ""),
+      reserveRootPrefix: false,
+      credPrefix: root.credPrefix,
+    },
+    detect,
+  );
+}
+
 // Files that are neither included nor excluded: what the user could still choose to sync.
 export async function listCandidates(agentDir: string, config: SyncConfig): Promise<string[]> {
-  const { found } = await walk(agentDir, config);
+  const { found } = await walk(agentDir, config.exclude, true);
   return found
     .filter((f) => f.kind === "file" && !matchesAny(config.include, f.path))
     .map((f) => f.path)
+    .sort();
+}
+
+// Config is unused today; kept so roots and the agent dir share one call shape.
+export async function listRootCandidates(root: ResolvedRoot, _config: SyncConfig): Promise<string[]> {
+  const { found } = await walk(root.dir, rootExclude(root), false);
+  return found
+    .filter((f) => f.kind === "file" && !matchesAny(root.include, f.path))
+    .map((f) => joinRootPath(root.name, f.path))
     .sort();
 }

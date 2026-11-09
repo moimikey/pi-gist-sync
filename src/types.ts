@@ -30,8 +30,20 @@ export class GistSyncError extends Error {
 
 export type CredentialMode = "skip" | "encrypt";
 
+/** A directory outside the agent dir that is synced under the gist namespace `@name/`. Local config only, never read from the gist. */
+export interface RootConfig {
+  /** Absolute, or starting with `~` or `~/` (expanded against the home dir). */
+  dir: string;
+  /** Globs relative to `dir`. Required and non-empty: a root syncs nothing by default. */
+  include: string[];
+  /** Globs relative to `dir`, applied after include. */
+  exclude: string[];
+}
+
 export interface SyncConfig {
   gistId?: string;
+  /** Extra directories to sync, keyed by root name (see ROOT_NAME in roots.ts). Default: none. */
+  roots: Record<string, RootConfig>;
   /** Globs relative to the agent dir. Defaults: DEFAULT_INCLUDE in config.ts. */
   include: string[];
   /** Globs relative to the agent dir. Applied after include. */
@@ -95,6 +107,7 @@ export type SkipReason =
   | "credential"
   | "secret-detected"
   | "symlink"
+  | "native-binary"
   | "unreadable";
 
 export interface ScannedFile {
@@ -166,6 +179,8 @@ export interface Plan {
 
 export interface SyncEnv {
   agentDir: string;
+  /** Home dir used to expand `~` in root dirs. Defaults to os.homedir(); tests pass a temp dir. */
+  home?: string;
   client: GistClient;
   /** For encrypt mode; undefined means "no passphrase available". */
   passphrase?: string;
@@ -203,6 +218,8 @@ export interface PullReview {
   size?: number;
   /** For settings.json: the changed keys that are not on the safe list. */
   keys?: string[];
+  /** For a path under a root: the absolute file that will be written or deleted, so the prompt shows where it lands. */
+  dest?: string;
 }
 
 export interface PullPlan {

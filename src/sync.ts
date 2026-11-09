@@ -1,16 +1,19 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { copyFile, lstat, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { assertSafeRelPath, encodePath, fromGistContent, sha256Hex, toGistContent } from "./codec.ts";
+import { assertSafeRelPath, encodePath, fromGistContent, isSafeRelPath, relPathProblem, sha256Hex, toGistContent } from "./codec.ts";
 import {
   BACKUP_DIR,
   clearState,
   isAlwaysExcluded,
   isCredentialPath,
+  isExcludedBy,
   loadConfig,
   loadState,
+  PORTABLE_EXCLUDE,
   saveConfig,
   saveState,
 } from "./config.ts";
@@ -19,7 +22,9 @@ import type { CryptoParams } from "./crypto.ts";
 import { matchesAny } from "./globs.ts";
 import { manifestSigningText, parseManifest, serializeManifest } from "./manifest.ts";
 import { planSync } from "./plan.ts";
-import { listCandidates, scanAgentDir } from "./scan.ts";
+import { isRootCredential, ROOT_NAME, ROOT_PREFIX, resolveRoots, splitRootPath } from "./roots.ts";
+import type { ResolvedRoot, RootProblem } from "./roots.ts";
+import { isNativeBinary, listCandidates, listRootCandidates, scanAgentDir, scanRoot } from "./scan.ts";
 import { detectSecrets } from "./secrets.ts";
 import { canonicalSettings, mergeMachineLocal, parseSettings, unsafeSettingsChanges } from "./settings-merge.ts";
 import {
@@ -36,6 +41,7 @@ import {
   type PullResult,
   type PushResult,
   type ReviewTier,
+  type ScannedFile,
   type SideEntry,
   type SkippedFile,
   type StatusResult,
@@ -50,6 +56,8 @@ const SETTINGS_FILE = "settings.json";
 // Ids end up in a URL path, so anything beyond this alphabet is refused up front.
 const GIST_ID = /^[A-Za-z0-9_-]{1,100}$/;
 const MAX_LISTED = 20;
+// A gist holds at most 300 files, and the manifest is one of them.
+const MAX_GIST_FILES = 300;
 const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const INSTRUCTION_FILES = new Set(["agents.md", "agents.override.md", "claude.md", "system.md", "append_system.md"]);
 // The only paths a pull applies without asking: display-only files. Everything else can run code or steer the model.
@@ -75,15 +83,73 @@ function bad(message: string): GistSyncError {
 
 // ---- scope policy: which paths this machine may push, delete or write ------
 
-function isSyncable(config: SyncConfig, path: string): boolean {
-  return !isAlwaysExcluded(path) && matchesAny(config.include, path) && !matchesAny(config.exclude, path);
+/** Where paths live on this machine. Roots come only from the local config, never from the gist. */
+interface Where {
+  agentDir: string;
+  roots: ReadonlyMap<string, ResolvedRoot>;
+  /** dev:ino of the agent dir and its ancestors; a root write that reaches one of them is refused. */
+  agentIds?: ReadonlySet<string>;
+}
+
+interface Place {
+  base: string;
+  rel: string;
+  root: ResolvedRoot | undefined;
+}
+
+// An `@` path belongs to a configured root or to nothing: the agent dir never holds one.
+function placeOf(where: Where, path: string): Place | undefined {
+  if (!path.startsWith(ROOT_PREFIX)) return { base: where.agentDir, rel: path, root: undefined };
+  const split = splitRootPath(path);
+  const root = split ? where.roots.get(split.name) : undefined;
+  if (!split || !root) return undefined;
+  return { base: root.dir, rel: split.rel, root };
+}
+
+function isSyncable(scope: Where & { config: SyncConfig }, path: string): boolean {
+  const place = placeOf(scope, path);
+  if (!place) return false;
+  const { rel, root } = place;
+  if (!root) return !isAlwaysExcluded(path) && matchesAny(scope.config.include, path) && !isExcludedBy(scope.config.exclude, path);
+  return (
+    isSafeRelPath(rel) &&
+    !isAlwaysExcluded(rel) &&
+    matchesAny(root.include, rel) &&
+    !isExcludedBy(root.exclude, rel) &&
+    !isExcludedBy(PORTABLE_EXCLUDE, rel)
+  );
+}
+
+// Policy checks on a root file use its path inside the root, as the scanner did.
+function policyPath(path: string): string {
+  return splitRootPath(path)?.rel ?? path;
+}
+
+// A root file is also judged by its place under home, so `.kube/config` counts and not just `config`.
+function isCredential(where: Where, path: string): boolean {
+  const place = placeOf(where, path);
+  if (place?.root) return isRootCredential(place.root, place.rel);
+  return isCredentialPath(policyPath(path));
+}
+
+/** Why an out-of-scope remote path is skipped, naming the root when one is missing. */
+function exclusion(scope: Where & { config: SyncConfig }, path: string): SkippedFile {
+  if (path.startsWith(ROOT_PREFIX)) {
+    const split = splitRootPath(path);
+    if (!split) return { path, reason: "excluded", detail: `the ${ROOT_PREFIX} prefix is reserved for roots` };
+    if (!scope.roots.has(split.name)) {
+      const known = Object.hasOwn(scope.config.roots, split.name);
+      return { path, reason: "excluded", detail: `root "${split.name}" is ${known ? "not available" : "not configured"}` };
+    }
+  }
+  return { path, reason: "excluded" };
 }
 
 function guardedBy(skipped: readonly SkippedFile[], path: string): SkippedFile | undefined {
   return skipped.find((s) => path === s.path || path.startsWith(`${s.path}/`));
 }
 
-interface Scope {
+interface Scope extends Where {
   config: SyncConfig;
   /** Local files the scan could not read or policy withheld; remote copies of them are left alone. */
   skipped: readonly SkippedFile[];
@@ -93,11 +159,11 @@ interface Scope {
 
 // Out-of-scope paths are never pushed, deleted or overwritten, whatever the other side says.
 function outOfScope(scope: Scope, path: string): boolean {
-  return !isSyncable(scope.config, path) || guardedBy(scope.skipped, path) !== undefined || scope.refused.has(path);
+  return !isSyncable(scope, path) || guardedBy(scope.skipped, path) !== undefined || scope.refused.has(path);
 }
 
 function affectsReload(path: string): boolean {
-  const lower = path.toLowerCase();
+  const lower = policyPath(path).toLowerCase();
   if (["extensions/", "skills/", "prompts/", "themes/"].some((dir) => lower.startsWith(dir))) return true;
   return lower === SETTINGS_FILE || lower === "mcp.json" || INSTRUCTION_FILES.has(lower);
 }
@@ -125,28 +191,100 @@ function canonicalBytes(path: string, bytes: Uint8Array): Uint8Array {
   return canon === text ? bytes : new Uint8Array(Buffer.from(canon, "utf8"));
 }
 
+interface Roots {
+  roots: Map<string, ResolvedRoot>;
+  problems: RootProblem[];
+}
+
+function loadRoots(env: SyncEnv, config: SyncConfig): Promise<Roots> {
+  return resolveRoots(config, { agentDir: env.agentDir, home: env.home ?? homedir() });
+}
+
+function idOf(st: { dev: number; ino: number }): string {
+  return `${st.dev}:${st.ino}`;
+}
+
+// The agent dir and every existing ancestor, so an aliased path into it (firmlink, bind mount) is still recognised.
+async function agentIdsOf(agentDir: string): Promise<Set<string>> {
+  const ids = new Set<string>();
+  for (let dir = agentDir; ; dir = dirname(dir)) {
+    try {
+      ids.add(idOf(await stat(dir)));
+    } catch {
+      // Not created yet; its ancestors still count.
+    }
+    if (dirname(dir) === dir) return ids;
+  }
+}
+
+// Root names and dirs come from a hand-editable config, so a newline there must not forge a report line.
+function oneLine(text: string): string {
+  return text.replace(/[\p{Cc}\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu, "?");
+}
+
+function rootLines(problems: readonly RootProblem[]): string[] {
+  return problems.map((p) => `Root "${oneLine(p.name)}" ignored: ${oneLine(p.message)}`);
+}
+
+interface LocalScan {
+  files: Map<string, LocalFile>;
+  /** Everything the scan withheld, for the report. */
+  skipped: SkippedFile[];
+  /** Withheld local paths whose remote copies must be left alone. */
+  guards: SkippedFile[];
+}
+
 async function scanLocal(
   env: SyncEnv,
   config: SyncConfig,
-): Promise<{ files: Map<string, LocalFile>; skipped: SkippedFile[] }> {
+  roots: ReadonlyMap<string, ResolvedRoot>,
+): Promise<LocalScan> {
   // The scanner sees the bytes that would be uploaded, so a stripped machine-local key never flags the file.
-  const scan = await scanAgentDir(env.agentDir, config, (bytes, path) => detectSecrets(canonicalBytes(path, bytes)));
+  const agent = await scanAgentDir(env.agentDir, config, (bytes, path) => detectSecrets(canonicalBytes(path, bytes)));
+  const found: ScannedFile[] = [];
+  const skipped: SkippedFile[] = [];
+  // Agent-dir `@` entries are reported but must not shadow a root's remote files.
+  const reserved: SkippedFile[] = [];
+  for (const s of agent.skipped) (s.path.startsWith(ROOT_PREFIX) ? reserved : skipped).push(s);
+  for (const f of agent.files) {
+    // Only roots may publish `@` paths, so an agent-dir entry there would impersonate one.
+    if (f.path.startsWith(ROOT_PREFIX)) {
+      reserved.push({ path: f.path, reason: "unreadable", detail: `the ${ROOT_PREFIX} prefix is reserved for roots` });
+    } else {
+      found.push(f);
+    }
+  }
+  for (const root of roots.values()) {
+    // Root bytes are uploaded as is, so the scanner sees them raw.
+    const scan = await scanRoot(root, config, (bytes) => detectSecrets(bytes));
+    skipped.push(...scan.skipped);
+    for (const f of scan.files) {
+      const problem = relPathProblem(f.path);
+      if (splitRootPath(f.path)?.name !== root.name || problem !== undefined) {
+        skipped.push({ path: f.path, reason: "unreadable", detail: `unsupported file name: ${problem ?? "outside its root"}` });
+      } else {
+        found.push(f);
+      }
+    }
+  }
+  const where: Where = { agentDir: env.agentDir, roots };
   const files = new Map<string, LocalFile>();
-  const skipped: SkippedFile[] = [...scan.skipped];
-  for (const f of scan.files) {
+  for (const f of found) {
     if (f.path === SETTINGS_FILE && !isValidSettings(f.bytes)) {
       // Unparseable settings would upload machine-local keys unstripped, so they stay local.
       skipped.push({ path: f.path, reason: "unreadable", detail: "settings.json is not a valid JSON object" });
       continue;
     }
     if (f.sensitive && config.credentials === "skip") {
-      skipped.push({ path: f.path, reason: isCredentialPath(f.path) ? "credential" : "secret-detected" });
+      skipped.push({ path: f.path, reason: isCredential(where, f.path) ? "credential" : "secret-detected" });
       continue;
     }
     files.set(f.path, { path: f.path, mode: f.mode & 0o777, bytes: canonicalBytes(f.path, f.bytes), sensitive: f.sensitive });
   }
+  const guards = [...skipped];
+  skipped.push(...reserved);
   skipped.sort((a, b) => byText(a.path, b.path));
-  return { files, skipped };
+  return { files, skipped, guards };
 }
 
 function isValidSettings(bytes: Uint8Array): boolean {
@@ -193,8 +331,8 @@ async function fetchRemote(env: SyncEnv, gistId: string, state: SyncState | unde
   const seen = new Set<string>();
   for (const path of Object.keys(manifest.files)) {
     assertSafeRelPath(path);
-    // Two names that differ only in case would hit one file on a case-insensitive disk.
-    const lower = path.toLowerCase();
+    // Names differing only in case or Unicode normal form are one file on APFS and NTFS.
+    const lower = path.normalize("NFC").toLowerCase();
     if (seen.has(lower)) throw bad(`Manifest lists paths that differ only in case: ${path}`);
     seen.add(lower);
   }
@@ -375,8 +513,10 @@ async function push(env: SyncEnv, opts: { force?: boolean; dryRun?: boolean }): 
   if (remote.snapshot.public === true) {
     throw new GistSyncError("API", "That gist is public. Pushing would publish your Pi config; link a secret gist with /gist-sync init instead.");
   }
-  const scan = await scanLocal(env, config);
-  const scope: Scope = { config, skipped: scan.skipped, refused: new Set() };
+  const { roots, problems } = await loadRoots(env, config);
+  const scan = await scanLocal(env, config, roots);
+  const scope: Scope = { config, agentDir: env.agentDir, roots, agentIds: await agentIdsOf(env.agentDir), skipped: scan.guards, refused: new Set() };
+  const notes = [...rootLines(problems), ...skippedLines(scan.skipped)];
 
   const locals = [...scan.files.values()].filter((f) => !outOfScope(scope, f.path));
   const auth = await authenticate(env, gistId, state, remote);
@@ -416,13 +556,22 @@ async function push(env: SyncEnv, opts: { force?: boolean; dryRun?: boolean }): 
   const deleted = pathsOf(items, "delete");
   const changed = added.length + updated.length + deleted.length > 0;
   const gistUrl = remote.snapshot.htmlUrl;
+  // Out-of-scope remote entries stay in the gist, so they count too; past the cap every machine's manifest fails to parse.
+  const gone = new Set(deleted);
+  const total = new Set([...Object.keys(remote.entries).filter((p) => !gone.has(p)), ...added, ...updated]).size;
+  if (total + 1 > MAX_GIST_FILES) {
+    throw new GistSyncError(
+      "TOO_MANY_FILES",
+      `The gist would hold ${total} files plus the manifest, over GitHub's limit of ${MAX_GIST_FILES}. Nothing was written. Narrow include or a root's globs.`,
+    );
+  }
 
   if (opts.dryRun) {
     const lines = ["Dry run: nothing was written."];
     if (conflicts.length > 0) lines.push(pathLine(force ? "Would overwrite conflicting:" : "Conflicts (use --force):", conflicts));
     lines.push(changed ? "Would push:" : "Nothing to push.", ...listLines(items));
     return {
-      lines: [...lines, ...skippedLines(scan.skipped)],
+      lines: [...lines, ...notes],
       skipped: scan.skipped,
       gistUrl,
       revision: remote.revision,
@@ -437,7 +586,7 @@ async function push(env: SyncEnv, opts: { force?: boolean; dryRun?: boolean }): 
   if (!changed) {
     await persistState(env, gistId, state, state?.revision ?? remote.revision, nextBase(base, items, source, target, keep), auth.verified);
     return {
-      lines: ["Nothing to push. The gist is up to date.", ...skippedLines(scan.skipped)],
+      lines: ["Nothing to push. The gist is up to date.", ...notes],
       skipped: scan.skipped,
       gistUrl,
       revision: remote.revision,
@@ -490,7 +639,7 @@ async function push(env: SyncEnv, opts: { force?: boolean; dryRun?: boolean }): 
     lines: [
       `Pushed ${added.length + updated.length + deleted.length} file(s) to ${result.htmlUrl} (revision ${revision}).`,
       ...listLines(items),
-      ...skippedLines(scan.skipped),
+      ...notes,
     ],
     skipped: scan.skipped,
     gistUrl: result.htmlUrl,
@@ -506,11 +655,32 @@ async function push(env: SyncEnv, opts: { force?: boolean; dryRun?: boolean }): 
 
 type Target = { abs: string } | { symlink: true } | { blocked: string };
 
-/** Resolves a manifest path under agentDir, refusing symlinks so a write can never leave it. */
-async function resolveTarget(agentDir: string, path: string): Promise<Target> {
+/** Resolves a manifest path under the agent dir or its root's dir, refusing symlinks so a write can never leave it. */
+async function resolveTarget(where: Where, path: string): Promise<Target> {
   assertSafeRelPath(path);
-  const segments = path.split("/");
-  let current = agentDir;
+  const place = placeOf(where, path);
+  if (!place) return { blocked: "no configured root holds this path" };
+  assertSafeRelPath(place.rel);
+  const base = place.base;
+  if (place.root) {
+    // A root dir is never created, and one swapped for a symlink since it was resolved is refused.
+    let st;
+    try {
+      st = await lstat(base);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return { blocked: code === "ENOENT" ? "the root dir is missing" : (code ?? "the root dir cannot be inspected") };
+    }
+    if (st.isSymbolicLink()) return { symlink: true };
+    if (!st.isDirectory()) return { blocked: "the root dir is not a directory" };
+    // lstat follows symlinked parents, so a swapped ~/.local shows up only as a different identity.
+    if (place.root.id !== undefined && idOf(await stat(base)) !== place.root.id) {
+      return { blocked: "the root dir changed since it was resolved" };
+    }
+    if (where.agentIds?.has(idOf(st))) return { blocked: "the root dir reaches the agent dir" };
+  }
+  const segments = place.rel.split("/");
+  let current = base;
   for (const [i, segment] of segments.entries()) {
     current = join(current, segment);
     let st;
@@ -524,13 +694,15 @@ async function resolveTarget(agentDir: string, path: string): Promise<Target> {
       return { blocked: code ?? "cannot be inspected" };
     }
     if (st.isSymbolicLink()) return { symlink: true };
+    // A bind-mounted subdir could lead back into the agent dir and its config.
+    if (place.root && where.agentIds?.has(idOf(st))) return { blocked: "the path reaches the agent dir" };
     const last = i === segments.length - 1;
     if (!last && !st.isDirectory()) return { blocked: "a parent is a file" };
     if (last && st.isDirectory()) return { blocked: "a directory is in the way" };
   }
-  const abs = join(agentDir, ...segments);
-  const rel = relative(agentDir, abs);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) throw bad(`Path escapes the agent dir: ${path}`);
+  const abs = join(base, ...segments);
+  const rel = relative(base, abs);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) throw bad(`Path escapes ${place.root ? "its root" : "the agent dir"}: ${path}`);
   return { abs };
 }
 
@@ -547,6 +719,8 @@ interface View {
   undecryptable: string[];
   /** Remote entries left alone because of local policy. */
   skipped: SkippedFile[];
+  /** Root name -> count of remote files under a root this machine has not configured. */
+  unconfigured: Map<string, number>;
   source: Sides;
   target: Sides;
   targets: Map<string, string>;
@@ -569,24 +743,28 @@ async function buildView(
   gistId: string,
   state: SyncState | undefined,
   remote: Remote,
-  scan: { files: Map<string, LocalFile>; skipped: SkippedFile[] },
+  scan: LocalScan,
+  roots: ReadonlyMap<string, ResolvedRoot>,
 ): Promise<View> {
-  const scope: Scope = { config, skipped: scan.skipped, refused: new Set() };
+  const scope: Scope = { config, agentDir: env.agentDir, roots, agentIds: await agentIdsOf(env.agentDir), skipped: scan.guards, refused: new Set() };
   const skipped: SkippedFile[] = [];
+  const unconfigured = new Map<string, number>();
   const live: Array<[string, ManifestEntry]> = [];
   const targets = new Map<string, string>();
 
   for (const [path, entry] of Object.entries(remote.entries)) {
-    if (!isSyncable(config, path)) {
-      skipped.push({ path, reason: "excluded" });
+    if (!isSyncable(scope, path)) {
+      skipped.push(exclusion(scope, path));
+      const name = splitRootPath(path)?.name;
+      if (name !== undefined && !Object.hasOwn(config.roots, name)) unconfigured.set(name, (unconfigured.get(name) ?? 0) + 1);
       continue;
     }
-    const local = guardedBy(scan.skipped, path);
+    const local = guardedBy(scan.guards, path);
     if (local) {
       skipped.push({ ...local, path });
       continue;
     }
-    if (entry.protection === "plain" && isCredentialPath(path)) {
+    if (entry.protection === "plain" && isCredential(scope, path)) {
       // Credentials only ever travel encrypted, so a plain one is a planted file, not a sync.
       scope.refused.add(path);
       skipped.push({ path, reason: "credential" });
@@ -597,7 +775,7 @@ async function buildView(
       skipped.push({ path, reason: "too-large", detail: `${entry.size} bytes exceeds maxFileBytes ${config.maxFileBytes}` });
       continue;
     }
-    const resolved = await resolveTarget(env.agentDir, path);
+    const resolved = await resolveTarget(scope, path);
     if ("symlink" in resolved) {
       scope.refused.add(path);
       skipped.push({ path, reason: "symlink" });
@@ -646,10 +824,22 @@ async function buildView(
     verified: auth.verified,
     undecryptable: undecryptable.sort(byText),
     skipped,
+    unconfigured,
     source,
     target,
     targets,
   };
+}
+
+// Only a valid name is echoed into a command line; anything else could not be configured anyway.
+function unconfiguredLines(unconfigured: ReadonlyMap<string, number>): string[] {
+  return [...unconfigured]
+    .filter(([name]) => ROOT_NAME.test(name))
+    .sort(([a], [b]) => byText(a, b))
+    .map(
+      ([name, n]) =>
+        `${n} file(s) under root "${name}" were not applied. Configure it locally with: /gist-sync roots add ${name} <dir> <glob...>`,
+    );
 }
 
 /** Decodes one remote entry to bytes and proves it matches its manifest digest and size. */
@@ -695,9 +885,9 @@ function safeMode(mode: number, credential: boolean): number {
   return credential ? 0o600 : ((mode & 0o755) | 0o600) & 0o777;
 }
 
-async function writeAtomic(agentDir: string, path: string, bytes: Uint8Array, mode: number): Promise<void> {
+async function writeAtomic(where: Where, path: string, bytes: Uint8Array, mode: number): Promise<void> {
   // Re-checked at write time in case a path component was swapped for a symlink since planning.
-  const resolved = await resolveTarget(agentDir, path);
+  const resolved = await resolveTarget(where, path);
   if (!usable(resolved)) throw bad(`Refusing to write ${path}: ${"symlink" in resolved ? "it is behind a symlink" : resolved.blocked}.`);
   const dir = dirname(resolved.abs);
   await mkdir(dir, { recursive: true });
@@ -720,16 +910,27 @@ async function writeAtomic(agentDir: string, path: string, bytes: Uint8Array, mo
   }
 }
 
-async function backup(agentDir: string, root: string, path: string): Promise<boolean> {
-  const resolved = await resolveTarget(agentDir, path);
-  if (!usable(resolved) || !(await exists(resolved.abs))) return false;
-  const dest = join(root, ...path.split("/"));
-  await mkdir(dirname(dest), { recursive: true, mode: 0o700 });
-  try {
-    await copyFile(resolved.abs, dest, constants.COPYFILE_EXCL);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+// A fresh dir per pull: two pulls in one millisecond must not share one and silently drop a backup.
+async function claimBackupDir(parent: string, stamp: string): Promise<string> {
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  for (let n = 0; ; n++) {
+    const dir = join(parent, n === 0 ? stamp : `${stamp}-${randomBytes(3).toString("hex")}`);
+    try {
+      await mkdir(dir, { mode: 0o700 });
+      return dir;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || n >= 5) throw err;
+    }
   }
+}
+
+async function backup(where: Where, root: () => Promise<string>, path: string): Promise<boolean> {
+  const resolved = await resolveTarget(where, path);
+  if (!usable(resolved) || !(await exists(resolved.abs))) return false;
+  const dest = join(await root(), ...path.split("/"));
+  await mkdir(dirname(dest), { recursive: true, mode: 0o700 });
+  // The dir is fresh, so an existing copy means something is wrong; never report a backup that did not happen.
+  await copyFile(resolved.abs, dest, constants.COPYFILE_EXCL);
   return true;
 }
 
@@ -738,9 +939,13 @@ interface Ready {
   mode: number;
 }
 
-function tierOf(path: string): ReviewTier {
+function tierOf(path: string, mode: number | undefined): ReviewTier {
+  // Root files land outside Pi's dir, often on PATH, so they are code wherever they sit.
+  if (path.startsWith(ROOT_PREFIX)) return "code";
+  // Pi puts <agentDir>/bin first on PATH for its bash tool, and any executable can be run.
+  if (mode !== undefined && (mode & 0o111) !== 0) return "code";
   const lower = path.toLowerCase();
-  if (lower.startsWith("extensions/") || lower === "mcp.json" || lower === "models.json" || lower === SETTINGS_FILE) return "code";
+  if (lower.startsWith("bin/") || lower.startsWith("extensions/") || lower === "mcp.json" || lower === "models.json" || lower === SETTINGS_FILE) return "code";
   if (["skills/", "agents/", "prompts/"].some((dir) => lower.startsWith(dir)) || INSTRUCTION_FILES.has(lower)) {
     return "instructions";
   }
@@ -757,11 +962,19 @@ function reviewFor(
   path: string,
   action: PullReview["action"],
   bytes: Uint8Array | undefined,
+  mode: number | undefined,
   settingsKeys: readonly string[],
+  where: Where,
 ): PullReview | undefined {
-  if (path === SAFE_FILE || path.startsWith(SAFE_DIR)) return undefined;
-  if (path === SETTINGS_FILE && action !== "delete" && settingsKeys.length === 0) return undefined;
-  const review: PullReview = { path, action, tier: tierOf(path) };
+  const place = placeOf(where, path);
+  if (!place?.root) {
+    // An executable file can be run whatever its name, so only a non-executable write (or a delete) is display-only.
+    const runnable = action !== "delete" && mode !== undefined && (mode & 0o111) !== 0;
+    if ((path === SAFE_FILE || path.startsWith(SAFE_DIR)) && !runnable) return undefined;
+    if (path === SETTINGS_FILE && action !== "delete" && settingsKeys.length === 0) return undefined;
+  }
+  const review: PullReview = { path, action, tier: tierOf(path, mode) };
+  if (place?.root) review.dest = join(place.base, ...place.rel.split("/"));
   if (bytes) {
     review.sha256 = sha256Hex(bytes);
     review.size = bytes.length;
@@ -780,8 +993,10 @@ async function pull(
   if (!remote.manifest) {
     return { lines: ["The gist has no synced files yet. Run /gist-sync push first."], skipped: [], applied: [], needsReload: false };
   }
-  const scan = await scanLocal(env, config);
-  const view = await buildView(env, config, gistId, state, remote, scan);
+  const { roots, problems } = await loadRoots(env, config);
+  const scan = await scanLocal(env, config, roots);
+  const view = await buildView(env, config, gistId, state, remote, scan, roots);
+  const where = view.scope;
   const base = state?.files ?? {};
   const prune = opts.prune === true;
 
@@ -794,20 +1009,25 @@ async function pull(
   const resolved = resolveItems(plan.items, force, view.source, view.target);
   const pendingDeletes = pathsOf(resolved, "delete");
   // Without --prune a remote delete is only reported, so the sync state must keep its old base.
-  const items = resolved.map((i): PlanItem => (i.action === "delete" && !prune ? { path: i.path, action: "unchanged" } : i));
-  const writes = items.filter((i) => i.action === "add" || i.action === "update").map((i) => i.path);
+  let items = resolved.map((i): PlanItem => (i.action === "delete" && !prune ? { path: i.path, action: "unchanged" } : i));
+  const planned = items.filter((i) => i.action === "add" || i.action === "update").map((i) => i.path);
   const deletes = prune ? pendingDeletes : [];
-  const applied = [...writes, ...deletes].sort(byText);
   const localOnly = prune ? [] : pendingDeletes;
   const actionOf = new Map(items.map((i) => [i.path, i.action]));
 
   // Verify every entry before touching disk: one bad digest means nothing is written.
   const ready = new Map<string, Ready>();
   const settingsKeys: string[] = [];
-  const localSettings = writes.includes(SETTINGS_FILE) ? await readLocalText(join(env.agentDir, SETTINGS_FILE)) : undefined;
-  for (const path of writes) {
+  const localSettings = planned.includes(SETTINGS_FILE) ? await readLocalText(join(env.agentDir, SETTINGS_FILE)) : undefined;
+  for (const path of planned) {
     const entry = own(remote.entries, path) as ManifestEntry;
     let bytes = decodeEntry(remote.snapshot, path, entry, view.key);
+    // Push never sends one, so a native executable in the gist was planted; it would land runnable.
+    if (isNativeBinary(bytes)) {
+      view.scope.refused.add(path);
+      view.skipped.push({ path, reason: "native-binary" });
+      continue;
+    }
     if (path === SETTINGS_FILE) {
       let remoteText: string;
       try {
@@ -826,13 +1046,18 @@ async function pull(
     if (own(view.target, path) === undefined && (await exists(view.targets.get(path) as string))) {
       throw new GistSyncError("CONFLICT", `${path} already exists locally but was not scanned (name clash by case, or created during the pull).`);
     }
-    const credential = entry.protection === "encrypted" || isCredentialPath(path);
+    const credential = entry.protection === "encrypted" || isCredential(where, path);
     ready.set(path, { bytes, mode: safeMode(entry.mode, credential) });
   }
+  // A refused entry stays unchanged, so the old base is kept and it is not reported as applied.
+  items = items.map((i): PlanItem => (view.scope.refused.has(i.path) ? { path: i.path, action: "unchanged" } : i));
+  const writes = planned.filter((p) => ready.has(p));
+  const applied = [...writes, ...deletes].sort(byText);
 
   const review: PullReview[] = [];
   for (const path of applied) {
-    const item = reviewFor(path, reviewAction(path, actionOf.get(path), deletes), ready.get(path)?.bytes, path === SETTINGS_FILE ? settingsKeys : []);
+    const mode = ready.get(path)?.mode ?? own(view.target, path)?.mode;
+    const item = reviewFor(path, reviewAction(path, actionOf.get(path), deletes), ready.get(path)?.bytes, mode, path === SETTINGS_FILE ? settingsKeys : [], where);
     if (item) review.push(item);
   }
   const pullPlan: PullPlan = {
@@ -846,7 +1071,7 @@ async function pull(
     undecryptable: view.undecryptable,
   };
 
-  const notes: string[] = [];
+  const notes: string[] = [...rootLines(problems), ...unconfiguredLines(view.unconfigured)];
   if (localOnly.length > 0) notes.push(pathLine("Removed remotely, kept locally (use --prune to delete):", localOnly));
   if (view.undecryptable.length > 0) {
     notes.push(pathLine("Encrypted, skipped (set PI_GIST_SYNC_PASSPHRASE to decrypt):", view.undecryptable));
@@ -858,7 +1083,11 @@ async function pull(
     const lines = ["Dry run: nothing was written."];
     if (conflicts.length > 0) lines.push(pathLine(force ? "Would overwrite conflicting:" : "Conflicts (use --force):", conflicts));
     lines.push(applied.length > 0 ? "Would pull:" : "Nothing to pull.", ...listLines(items.filter((i) => applied.includes(i.path))));
-    if (review.length > 0) lines.push(pathLine("Would ask before changing:", review.map((r) => r.path)));
+    // Every item, with its destination: this is what the user is told to read before approving.
+    if (review.length > 0) {
+      lines.push(`Would ask before changing (${review.length}):`);
+      for (const r of review) lines.push(`  ${r.action} ${r.path}${r.dest !== undefined ? ` -> ${r.dest}` : ""}`);
+    }
     return { lines: [...lines, ...notes], skipped: view.skipped, applied: [], needsReload: false };
   }
 
@@ -880,19 +1109,20 @@ async function pull(
 
   // Backups first, so a failure here still leaves every local file untouched.
   const stamp = env.now().toISOString().replaceAll(":", "-");
-  const root = join(env.agentDir, BACKUP_DIR, stamp);
+  let root: string | undefined;
+  const claim = async (): Promise<string> => (root ??= await claimBackupDir(join(env.agentDir, BACKUP_DIR), stamp));
   let backedUp = 0;
   // Whatever exists now is saved, including files created while the prompt was open.
   for (const path of applied) {
-    if (await backup(env.agentDir, root, path)) backedUp++;
+    if (await backup(where, claim, path)) backedUp++;
   }
 
   for (const path of writes) {
     const item = ready.get(path) as Ready;
-    await writeAtomic(env.agentDir, path, item.bytes, item.mode);
+    await writeAtomic(where, path, item.bytes, item.mode);
   }
   for (const path of deletes) {
-    const resolvedTarget = await resolveTarget(env.agentDir, path);
+    const resolvedTarget = await resolveTarget(where, path);
     if (!usable(resolvedTarget)) throw bad(`Refusing to delete ${path}: ${"symlink" in resolvedTarget ? "it is behind a symlink" : resolvedTarget.blocked}.`);
     await rm(resolvedTarget.abs, { force: true });
   }
@@ -902,10 +1132,10 @@ async function pull(
     `Pulled ${applied.length} file(s) from ${remote.snapshot.htmlUrl} (revision ${remote.revision}).`,
     ...listLines(items.filter((i) => applied.includes(i.path))),
   ];
-  if (backedUp > 0) lines.push(`Backed up ${backedUp} file(s) to ${BACKUP_DIR}/${stamp}.`);
+  if (backedUp > 0 && root) lines.push(`Backed up ${backedUp} file(s) to ${BACKUP_DIR}/${basename(root)}.`);
   lines.push(...notes);
   const result: PullResult = { lines, skipped: view.skipped, applied, needsReload: applied.some(affectsReload) };
-  if (backedUp > 0) result.backupDir = root;
+  if (backedUp > 0 && root) result.backupDir = root;
   return result;
 }
 
@@ -925,8 +1155,9 @@ async function status(env: SyncEnv): Promise<StatusResult> {
   }
   const { gistId, state } = await loadLinked(env);
   const remote = await fetchRemote(env, gistId, state, false);
-  const scan = await scanLocal(env, config);
-  const view = await buildView(env, config, gistId, state, remote, scan);
+  const { roots, problems } = await loadRoots(env, config);
+  const scan = await scanLocal(env, config, roots);
+  const view = await buildView(env, config, gistId, state, remote, scan, roots);
   const base = state?.files ?? {};
 
   const out = planSync(base, view.target, view.source);
@@ -948,6 +1179,7 @@ async function status(env: SyncEnv): Promise<StatusResult> {
     lines.push(`${view.undecryptable.length} encrypted file(s) not compared: set PI_GIST_SYNC_PASSPHRASE.`);
   }
   if (view.unverified) lines.push("Manifest signature not checked: set PI_GIST_SYNC_PASSPHRASE to verify it.");
+  lines.push(...rootLines(problems), ...unconfiguredLines(view.unconfigured));
   const result: StatusResult = {
     lines,
     skipped: scan.skipped,
@@ -1015,12 +1247,17 @@ async function confirmOwner(
 }
 
 async function scanCandidates(env: SyncEnv): Promise<string[]> {
-  return listCandidates(env.agentDir, await loadConfig(env.agentDir));
+  const config = await loadConfig(env.agentDir);
+  const out = await listCandidates(env.agentDir, config);
+  const { roots } = await loadRoots(env, config);
+  for (const root of roots.values()) out.push(...(await listRootCandidates(root, config)));
+  return out.sort(byText);
 }
 
 async function unlink(env: SyncEnv): Promise<void> {
   const config = await loadConfig(env.agentDir);
   await saveConfig(env.agentDir, {
+    roots: config.roots,
     include: config.include,
     exclude: config.exclude,
     credentials: config.credentials,

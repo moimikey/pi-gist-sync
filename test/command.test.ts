@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import type { CommandIO } from "../src/command.ts";
-import { describeReview, parseArgs, runCommand, startupCheck, SUBCOMMANDS } from "../src/command.ts";
+import { argumentCompletions, describeReview, parseArgs, runCommand, startupCheck, SUBCOMMANDS, wantsRootNames } from "../src/command.ts";
+import { loadConfig } from "../src/config.ts";
 import type {
   GistClient,
   PullPlan,
@@ -160,12 +161,18 @@ function fakeApi(over: Partial<SyncApi> = {}): FakeApi {
 
 const lastNote = (io: FakeIO) => io.notes[io.notes.length - 1];
 
-async function run(args: string, io: FakeIO, api: FakeApi, extra: { env?: NodeJS.ProcessEnv; agentDir?: string; client?: GistClient } = {}) {
+async function run(
+  args: string,
+  io: FakeIO,
+  api: FakeApi,
+  extra: { env?: NodeJS.ProcessEnv; agentDir?: string; client?: GistClient; home?: string } = {},
+) {
   await runCommand(args, io, {
     api,
     env: extra.env ?? { GH_TOKEN },
     agentDir: extra.agentDir ?? (await tmpAgentDir()),
     client: extra.client,
+    home: extra.home ?? (await tmpAgentDir()),
   });
 }
 
@@ -205,7 +212,7 @@ describe("parseArgs", () => {
 
 describe("SUBCOMMANDS", () => {
   it("lists every command from the spec", () => {
-    assert.deepEqual([...SUBCOMMANDS], ["init", "status", "push", "pull", "scan", "unlink", "help"]);
+    assert.deepEqual([...SUBCOMMANDS], ["init", "status", "push", "pull", "scan", "roots", "unlink", "help"]);
   });
 });
 
@@ -612,12 +619,23 @@ describe("pull confirm gating", () => {
     assert.doesNotMatch(io.confirms[0]!.message, /[\u001b\u202e]/);
   });
 
-  it("caps a long non-code list per tier and says how many were left out", async () => {
+  it("lists every entry of every tier, so nothing is approved unseen", async () => {
     const io = fakeIO({ confirmAnswers: [true] });
     const many = Array.from({ length: 40 }, (_, i) => review({ path: `notes/n${i}.md`, tier: "other" }));
     await run("pull", io, fakeApi(pullWithPlan({ ...emptyPlan, review: many })));
-    assert.match(io.confirms[0]!.message, /40 change\(s\) need your approval/);
-    assert.match(io.confirms[0]!.message, /and 32 more/);
+    const message = io.confirms[0]!.message;
+    assert.match(message, /40 change\(s\) need your approval/);
+    for (let i = 0; i < 40; i++) assert.ok(message.includes(`notes/n${i}.md`), `missing notes/n${i}.md`);
+    assert.doesNotMatch(message, /more$/m);
+  });
+
+  it("escapes look-alike characters in a root path and its destination", async () => {
+    const io = fakeIO({ confirmAnswers: [true] });
+    const plan = { ...emptyPlan, review: [review({ path: "@local-bin/piwt\u00a0", dest: "/h/.local/bin/piwt\u00a0" })] };
+    await run("pull", io, fakeApi(pullWithPlan(plan)));
+    const message = io.confirms[0]!.message;
+    assert.match(message, /update @local-bin\/piwt\\u\{a0\} -> \/h\/\.local\/bin\/piwt\\u\{a0\}/);
+    assert.doesNotMatch(message, /\u00a0/);
   });
 
   it("never truncates the code tier, so no code is approved unseen", async () => {
@@ -1021,5 +1039,302 @@ describe("extension entry", () => {
     const ctx = { hasUI: true, ui: { notify: () => assert.fail("must not notify") } };
     assert.equal(start({ type: "session_start", reason: "reload" }, ctx), undefined);
     assert.equal(start({ type: "session_start", reason: "resume" }, ctx), undefined);
+  });
+});
+
+// ---- roots -------------------------------------------------------------------------
+
+describe("roots", () => {
+  // Both the agent dir and home are temp dirs, so nothing here can reach the real ~.
+  async function setup(config?: Record<string, unknown>) {
+    const agentDir = await tmpAgentDir(config);
+    const home = await tmpAgentDir();
+    const binDir = join(home, "bin");
+    await mkdir(binDir);
+    return { agentDir, home, binDir };
+  }
+
+  async function roots(args: string, ctx: { agentDir: string; home: string }, io: FakeIO = fakeIO(), api: FakeApi = fakeApi()) {
+    await run(`roots ${args}`.trim(), io, api, { ...ctx, env: {} });
+    return { io, api, note: lastNote(io) };
+  }
+
+  it("is listed in help and needs no token or gist link", async () => {
+    const io = fakeIO();
+    await run("help", io, fakeApi());
+    assert.match(lastNote(io)?.message ?? "", /roots/);
+    const ctx = await setup();
+    const { note, io: rio, api } = await roots("", ctx);
+    assert.equal(note?.level, "info");
+    assert.match(note?.message ?? "", /No roots configured/);
+    assert.deepEqual(rio.execs, []);
+    assert.deepEqual(api.calls, []);
+  });
+
+  it("adds a valid root, preserves other config fields and prints the summary", async () => {
+    const ctx = await setup({ gistId: "abc123", credentials: "encrypt", maxFileBytes: 2048, checkOnStart: true, include: ["x/**"], exclude: ["y"] });
+    const { note } = await roots(`add local-bin ${ctx.binDir} piwt *.sh`, ctx);
+    assert.equal(note?.level, "info");
+    assert.equal(
+      note?.message,
+      `Root "local-bin" added: ${ctx.binDir} (2 include glob(s)). Everything under a root needs approval on pull.`,
+    );
+    const cfg = await loadConfig(ctx.agentDir);
+    assert.deepEqual(cfg.roots, { "local-bin": { dir: ctx.binDir, include: ["piwt", "*.sh"], exclude: [] } });
+    assert.equal(cfg.gistId, "abc123");
+    assert.equal(cfg.credentials, "encrypt");
+    assert.equal(cfg.maxFileBytes, 2048);
+    assert.equal(cfg.checkOnStart, true);
+    assert.deepEqual(cfg.include, ["x/**"]);
+    assert.deepEqual(cfg.exclude, ["y"]);
+  });
+
+  it("expands ~ against the injected home, not the real one", async () => {
+    const ctx = await setup();
+    const { note } = await roots("add local-bin ~/bin piwt", ctx);
+    assert.equal(note?.level, "info", note?.message);
+    assert.equal((await loadConfig(ctx.agentDir)).roots["local-bin"]?.dir, "~/bin");
+    const listed = await roots("", ctx);
+    assert.match(listed.note?.message ?? "", /local-bin {2}~\/bin {2}include: piwt {2}ok/);
+  });
+
+  it("refuses add without any include glob", async () => {
+    const ctx = await setup();
+    const { note } = await roots(`add local-bin ${ctx.binDir}`, ctx);
+    assert.equal(note?.level, "warning");
+    assert.match(note?.message ?? "", /at least one include glob/);
+    assert.match(note?.message ?? "", /Usage:/);
+    assert.deepEqual((await loadConfig(ctx.agentDir)).roots, {});
+  });
+
+  it("refuses an invalid name", async () => {
+    const ctx = await setup();
+    for (const bad of ["Local-Bin", "a.b", "a_b", "__proto__", "x".repeat(33)]) {
+      const { note } = await roots(`add ${bad} ${ctx.binDir} piwt`, ctx);
+      assert.equal(note?.level, "warning", bad);
+      assert.match(note?.message ?? "", /not a valid root name/, bad);
+    }
+    assert.deepEqual((await loadConfig(ctx.agentDir)).roots, {});
+  });
+
+  it("refuses a missing dir, a relative dir, home itself and an agent-dir overlap", async () => {
+    const ctx = await setup();
+    for (const dir of [join(ctx.home, "nope"), "bin", "~", ctx.agentDir, join(ctx.agentDir, "..")]) {
+      const { note } = await roots(`add local-bin ${dir} piwt`, ctx);
+      assert.equal(note?.level, "warning", dir);
+      assert.match(note?.message ?? "", /Root "local-bin" not added: /, dir);
+    }
+    assert.deepEqual((await loadConfig(ctx.agentDir)).roots, {});
+  });
+
+  it("refuses overlap with an existing root in either direction", async () => {
+    const ctx = await setup();
+    await mkdir(join(ctx.binDir, "sub"));
+    assert.equal((await roots(`add mid ${ctx.binDir} *`, ctx)).note?.level, "info");
+    // A nested dir under a later name is dropped itself.
+    const nested = await roots(`add zz ${join(ctx.binDir, "sub")} *`, ctx);
+    assert.equal(nested.note?.level, "warning");
+    // An earlier name would knock the existing root out instead; still refused.
+    const parent = await roots(`add aa ${join(ctx.binDir, "sub")} *`, ctx);
+    assert.equal(parent.note?.level, "warning");
+    assert.match(parent.note?.message ?? "", /not added/);
+    assert.deepEqual(Object.keys((await loadConfig(ctx.agentDir)).roots), ["mid"]);
+  });
+
+  it("refuses a duplicate name", async () => {
+    const ctx = await setup();
+    await roots(`add local-bin ${ctx.binDir} piwt`, ctx);
+    const { note } = await roots(`add local-bin ${ctx.binDir} other`, ctx);
+    assert.equal(note?.level, "warning");
+    assert.match(note?.message ?? "", /already exists/);
+    assert.deepEqual((await loadConfig(ctx.agentDir)).roots["local-bin"]?.include, ["piwt"]);
+  });
+
+  it("lists roots with their globs and ok or the problem", async () => {
+    const ctx = await setup({
+      roots: {
+        "local-bin": { dir: "~/bin", include: ["piwt"], exclude: ["*.bak"] },
+        gone: { dir: "~/missing", include: ["*"], exclude: [] },
+      },
+    });
+    const { note } = await roots("", ctx);
+    const msg = note?.message ?? "";
+    assert.equal(note?.level, "info");
+    assert.match(msg, /2 root\(s\)/);
+    assert.match(msg, /local-bin {2}~\/bin {2}include: piwt {2}exclude: \*\.bak {2}ok/);
+    assert.match(msg, /gone {2}~\/missing {2}include: \* {2}ignored: \S/);
+    assert.ok(msg.indexOf("gone") < msg.indexOf("local-bin"));
+  });
+
+  it("works with a root dir that is a symlink", async () => {
+    const ctx = await setup();
+    await symlink(ctx.binDir, join(ctx.home, "link"));
+    assert.equal((await roots(`add linked ${join(ctx.home, "link")} piwt`, ctx)).note?.level, "info");
+  });
+
+  it("removes a root from config only, keeping other fields", async () => {
+    const ctx = await setup({ gistId: "abc123", roots: { a: { dir: "~/bin", include: ["x"], exclude: [] }, b: { dir: "~/b", include: ["y"], exclude: [] } } });
+    await writeFile(join(ctx.binDir, "x"), "keep me");
+    const { note, api } = await roots("remove a", ctx);
+    assert.equal(note?.level, "info");
+    assert.match(note?.message ?? "", /Root "a" removed .*not touched/);
+    const cfg = await loadConfig(ctx.agentDir);
+    assert.deepEqual(Object.keys(cfg.roots), ["b"]);
+    assert.equal(cfg.gistId, "abc123");
+    assert.equal(await readFile(join(ctx.binDir, "x"), "utf8"), "keep me");
+    assert.deepEqual(api.calls, []);
+  });
+
+  it("warns on removing an unknown root", async () => {
+    const ctx = await setup();
+    const { note } = await roots("remove nope", ctx);
+    assert.equal(note?.level, "warning");
+    assert.match(note?.message ?? "", /No root named "nope"/);
+  });
+
+  it("prints usage at warning level for bad arguments and changes nothing", async () => {
+    const ctx = await setup({ roots: { a: { dir: "~/bin", include: ["x"], exclude: [] } } });
+    for (const args of ["frob", "remove", "remove a b", "add", "add a", "list", `add b ${ctx.binDir} x --yes`]) {
+      const { note } = await roots(args, ctx);
+      assert.equal(note?.level, "warning", args);
+      assert.match(note?.message ?? "", /Usage:/, args);
+    }
+    assert.deepEqual(Object.keys((await loadConfig(ctx.agentDir)).roots), ["a"]);
+  });
+});
+
+describe("roots completions", () => {
+  it("completes roots and its actions with the full argument text as value", () => {
+    assert.deepEqual(argumentCompletions("ro")?.map((i) => i.value), ["roots"]);
+    assert.deepEqual(argumentCompletions("roots ")?.map((i) => i.value), ["roots add", "roots remove"]);
+    assert.deepEqual(argumentCompletions("roots a")?.map((i) => i.label), ["add"]);
+    assert.deepEqual(argumentCompletions("roots r")?.map((i) => i.value), ["roots remove"]);
+    assert.equal(argumentCompletions("roots x"), null);
+    assert.equal(argumentCompletions("roots add local-bin "), null);
+  });
+
+  it("completes configured names after roots remove", () => {
+    assert.equal(wantsRootNames("roots remove "), true);
+    assert.equal(wantsRootNames("roots add "), false);
+    assert.deepEqual(argumentCompletions("roots remove ", ["dotfiles", "local-bin"])?.map((i) => i.value), [
+      "roots remove dotfiles",
+      "roots remove local-bin",
+    ]);
+    assert.deepEqual(argumentCompletions("roots remove lo", ["dotfiles", "local-bin"])?.map((i) => i.label), ["local-bin"]);
+    assert.equal(argumentCompletions("roots remove ", []), null);
+  });
+
+  it("the extension completes root names from the configured agent dir", async () => {
+    const agentDir = await tmpAgentDir({ roots: { "local-bin": { dir: "~/bin", include: ["x"], exclude: [] } } });
+    const saved = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      let registered: { getArgumentCompletions: (p: string) => unknown } | undefined;
+      registerExtension({ registerCommand: (_n: string, o: typeof registered) => (registered = o), on: () => {}, exec: async () => ({}) } as never);
+      const items = (await registered!.getArgumentCompletions("roots remove ")) as { value: string }[];
+      assert.deepEqual(items.map((i) => i.value), ["roots remove local-bin"]);
+      assert.deepEqual((registered!.getArgumentCompletions("roots ") as { label: string }[]).map((i) => i.label), ["add", "remove"]);
+    } finally {
+      if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = saved;
+    }
+  });
+});
+
+describe("home injection", () => {
+  it("passes deps.home into SyncEnv", async () => {
+    const home = await tmpAgentDir();
+    for (const sub of ["status", "push", "pull", "scan", "unlink", "init"]) {
+      const api = fakeApi();
+      await run(sub, fakeIO(), api, { home });
+      assert.equal(api.calls[0]?.env.home, home, sub);
+    }
+  });
+
+  it("defaults to os.homedir()", async () => {
+    const api = fakeApi();
+    await runCommand("status", fakeIO(), { api, env: { GH_TOKEN }, agentDir: await tmpAgentDir() });
+    assert.equal(api.calls[0]?.env.home, homedir());
+  });
+});
+
+describe("root files in the approval prompt", () => {
+  it("shows the destination after the path", async () => {
+    const io = fakeIO({ confirmAnswers: [true] });
+    const plan = { ...emptyPlan, review: [review({ path: "@local-bin/piwt", action: "add", dest: "/home/u/.local/bin/piwt", sha256: "ab".repeat(32), size: 10 })] };
+    await run("pull", io, fakeApi(pullWithPlan(plan)));
+    assert.match(io.confirms[0]!.message, /add @local-bin\/piwt -> \/home\/u\/\.local\/bin\/piwt {2}sha256:abababababab 10 B/);
+    assert.match(io.confirms[0]!.message, /Code and settings Pi runs \(1\)/);
+  });
+
+  it("sanitizes control characters, newlines and bidi marks in path and dest", async () => {
+    const io = fakeIO({ confirmAnswers: [true] });
+    const plan = { ...emptyPlan, review: [review({ path: "@r/a\u001b[2J\u202e", dest: "/x/a\nupdate fake.ts\u0007" })] };
+    await run("pull", io, fakeApi(pullWithPlan(plan)));
+    const msg = io.confirms[0]!.message;
+    assert.doesNotMatch(msg, /[\u001b\u202e\u0007]/);
+    // The forged second line must stay on the dest's own line.
+    assert.doesNotMatch(msg, /^update fake\.ts/m);
+    assert.match(msg, /update @r\/a\?\[2J\? -> \/x\/a\?update fake\.ts\?/);
+  });
+
+  it("sanitizes dest in the no-UI abort message too", async () => {
+    const io = fakeIO({ hasUI: false });
+    const plan = { ...emptyPlan, review: [review({ path: "@r/a", dest: "/x/\u001b[31mb\nfake" })] };
+    await run("pull", io, fakeApi(pullWithPlan(plan)));
+    assert.equal(lastNote(io)?.level, "error");
+    assert.match(lastNote(io)?.message ?? "", /@r\/a -> \/x\/\?\[31mb\?fake/);
+  });
+
+  it("never truncates root files in the code tier", () => {
+    const many = Array.from({ length: 30 }, (_, i) => review({ path: `@bin/s${i}`, dest: `/h/bin/s${i}` }));
+    const text = describeReview(many);
+    for (let i = 0; i < 30; i++) assert.ok(text.includes(`@bin/s${i} -> /h/bin/s${i}`), `missing s${i}`);
+    assert.doesNotMatch(text, /more$/m);
+  });
+});
+
+describe("scan with roots", () => {
+  it("shows root candidates alongside agent-dir files", async () => {
+    const io = fakeIO();
+    await run("scan", io, fakeApi({ scanCandidates: async () => ["notes.txt", "@local-bin/tool"] }), { env: {} });
+    const msg = lastNote(io)?.message ?? "";
+    assert.match(msg, /2 file\(s\) are not synced/);
+    assert.match(msg, /@local-bin\/tool/);
+  });
+});
+
+describe("roots hardening", () => {
+  async function ctxWith(config?: Record<string, unknown>) {
+    const agentDir = await tmpAgentDir(config);
+    const home = await tmpAgentDir();
+    return { agentDir, home };
+  }
+  const roots = async (args: string, ctx: { agentDir: string; home: string }) => {
+    const io = fakeIO();
+    await run(`roots ${args}`, io, fakeApi(), { ...ctx, env: {} });
+    return lastNote(io);
+  };
+
+  for (const store of [".ssh", ".config", ".aws", ".kube", ".docker", ".gnupg"]) {
+    it(`refuses a catch-all include on ~/${store}, but allows named files`, async () => {
+      const ctx = await ctxWith();
+      await mkdir(join(ctx.home, store));
+      for (const glob of ["**", "*", "**/*.json"]) {
+        const note = await roots(`add creds ~/${store} ${glob}`, ctx);
+        assert.equal(note?.level, "warning", glob);
+        assert.match(note?.message ?? "", new RegExp(`~/\\${store} holds credentials`));
+        assert.deepEqual((await loadConfig(ctx.agentDir)).roots, {});
+      }
+      const ok = await roots(`add creds ~/${store} my-app/app.conf`, ctx);
+      assert.equal(ok?.level, "info", ok?.message);
+    });
+  }
+
+  it("a newline in a hand-edited root cannot forge a line of the roots list", async () => {
+    const ctx = await ctxWith({ roots: { "x\n  evil  /  include: **  ok": { dir: "/nope\nfake", include: ["a\nb"], exclude: [] } } });
+    const note = await roots("", ctx);
+    assert.equal(note?.message.split("\n").length, 2, note?.message);
+    assert.match(note?.message ?? "", /x\?  evil/);
   });
 });

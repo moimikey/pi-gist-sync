@@ -2,8 +2,8 @@ import { randomBytes } from "node:crypto";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { matchesAny } from "./globs.ts";
-import type { CredentialMode, SyncConfig, SyncState } from "./types.ts";
+import { matchesAny, matchGlob } from "./globs.ts";
+import type { CredentialMode, RootConfig, SyncConfig, SyncState } from "./types.ts";
 
 export const CONFIG_FILE = "gist-sync.json";
 export const STATE_FILE = "gist-sync.state.json";
@@ -26,12 +26,16 @@ export const DEFAULT_INCLUDE: readonly string[] = Object.freeze([
   "prompts/**",
   "themes/**",
   "agents/**",
+  "bin/**",
   // third-party extension config such as mcp-adapter.json
   "*.json",
   "*.md",
+  // per-extension settings such as mf-plan/settings.json
+  "*/settings.json",
 ]);
 
-export const DEFAULT_EXCLUDE: readonly string[] = Object.freeze([
+// Junk that is never worth syncing from any directory; applies to every root on top of its own exclude.
+export const PORTABLE_EXCLUDE: readonly string[] = Object.freeze([
   "**/node_modules/**",
   "**/.git/**",
   "**/.DS_Store",
@@ -40,10 +44,22 @@ export const DEFAULT_EXCLUDE: readonly string[] = Object.freeze([
   "**/*.log",
   "**/*.jsonl",
   "**/*.tmp",
-  "*-cache.json",
-  "*-store.json",
   "**/__pycache__/**",
   "**/.ruff_cache/**",
+]);
+
+export const DEFAULT_EXCLUDE: readonly string[] = Object.freeze([
+  ...PORTABLE_EXCLUDE,
+  "*-cache.json",
+  "*-store.json",
+  // Pi downloads these per platform
+  "bin/fd",
+  "bin/rg",
+  "bin/fd.exe",
+  "bin/rg.exe",
+  // per-machine state
+  "**/last-seen-version.json",
+  "**/changelog-state.json",
   "sessions/**",
   "subagents/**",
   "checkpoints/**",
@@ -52,6 +68,16 @@ export const DEFAULT_EXCLUDE: readonly string[] = Object.freeze([
   "npm/**",
   "git/**",
   "memory-archive/**",
+  // extension runtime data
+  "ayu/**",
+  "pi-herdsman/**",
+  "missions/**",
+  "pi-warden/**",
+  "pi-sync/**",
+  "pi-cache-optimizer-stats.d/**",
+  "pi-pretty/**",
+  "memory/recovery/**",
+  "memory/daily/**",
 ]);
 
 // Matched case-insensitively at any depth: extensions keep tokens in nested dirs, and macOS ignores case.
@@ -63,10 +89,32 @@ export const CREDENTIAL_GLOBS: readonly string[] = Object.freeze([
   "**/*token*.json",
   "**/.env",
   "**/.env.*",
+  // common credential stores a root under ~ or ~/.config can reach
+  "**/.netrc",
+  "**/_netrc",
+  "**/.pgpass",
+  "**/.npmrc",
+  "**/.pypirc",
+  "**/.git-credentials",
+  "**/{.,}docker/config.json",
+  "**/{.,}kube/config",
+  "**/*.{pem,key,p12,pfx}",
+  "**/id_{rsa,dsa,ecdsa,ed25519}*",
+  "**/gh/hosts.yml",
 ]);
 
 export function isCredentialPath(path: string): boolean {
   return matchesAny(CREDENTIAL_GLOBS, path.toLowerCase());
+}
+
+// macOS and Windows disks usually ignore case, so `bin/RG` there is the file `bin/rg`.
+export const CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+
+/** Exclude match; folds case where the disk does, so a case variant cannot slip past an exclude. */
+export function isExcludedBy(globs: readonly string[], path: string, fold: boolean = CASE_INSENSITIVE_FS): boolean {
+  if (!fold) return matchesAny(globs, path);
+  const lower = path.toLowerCase();
+  return globs.some((g) => matchGlob(g.toLowerCase(), lower));
 }
 
 // Pi's own per-machine files: trust grants name absolute project paths, so a synced one would widen trust.
@@ -98,6 +146,7 @@ export function resolveAgentDir(env: NodeJS.ProcessEnv = process.env): string {
 
 export function defaultConfig(): SyncConfig {
   return {
+    roots: {},
     include: [...DEFAULT_INCLUDE],
     exclude: [...DEFAULT_EXCLUDE],
     credentials: "skip",
@@ -119,6 +168,19 @@ function isNotFound(err: unknown): boolean {
 }
 
 // ENOENT -> undefined; a file that is not valid JSON is treated like a missing one.
+// A malformed entry is dropped; the name is checked later by resolveRoots so `roots` can report it.
+function parseRoots(raw: unknown): Record<string, RootConfig> {
+  if (!isRecord(raw)) return {};
+  const out: [string, RootConfig][] = [];
+  for (const [name, entry] of Object.entries(raw)) {
+    if (!isRecord(entry) || typeof entry.dir !== "string" || !isStringArray(entry.include)) continue;
+    if (entry.exclude !== undefined && !isStringArray(entry.exclude)) continue;
+    out.push([name, { dir: entry.dir, include: [...entry.include], exclude: entry.exclude ? [...entry.exclude] : [] }]);
+  }
+  // fromEntries defines own properties, so a `__proto__` name stays data and fails ROOT_NAME later
+  return Object.fromEntries(out);
+}
+
 async function readJson(path: string): Promise<unknown> {
   let text: string;
   try {
@@ -140,6 +202,7 @@ export async function loadConfig(agentDir: string): Promise<SyncConfig> {
   if (!isRecord(raw)) return cfg;
 
   if (typeof raw.gistId === "string" && raw.gistId.length > 0) cfg.gistId = raw.gistId;
+  cfg.roots = parseRoots(raw.roots);
   if (isStringArray(raw.include)) cfg.include = raw.include;
   if (isStringArray(raw.exclude)) cfg.exclude = raw.exclude;
   if (raw.credentials === "skip" || raw.credentials === "encrypt") {
@@ -174,7 +237,11 @@ async function writeAtomic(agentDir: string, name: string, text: string): Promis
 
 export async function saveConfig(agentDir: string, cfg: SyncConfig): Promise<void> {
   // Whitelist fields so stray properties never reach disk
+  const roots = Object.fromEntries(
+    Object.entries(cfg.roots ?? {}).map(([name, r]) => [name, { dir: r.dir, include: r.include, exclude: r.exclude ?? [] }]),
+  );
   const out: SyncConfig = {
+    roots,
     include: cfg.include,
     exclude: cfg.exclude,
     credentials: cfg.credentials,

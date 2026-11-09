@@ -206,3 +206,11 @@ test("fromGistContent rejects bad base64 and unknown encodings", () => {
   }
   assert.throws(() => fromGistContent("abc", "rot13" as never), isBadManifest);
 });
+
+test("relPathProblem refuses non-ASCII spaces and blank filler letters that look like nothing", () => {
+  for (const p of ["piwt\u00a0", "piwt\u3164", "a\u2003b", "x\u115f", "x\u1160", "x\uffa0", "x\u2800", "a\u3000b"]) {
+    assert.equal(relPathProblem(p), "contains a non-ASCII space or blank character", JSON.stringify(p));
+  }
+  assert.equal(relPathProblem("my notes/a b.md"), undefined);
+  assert.equal(relPathProblem("caf\u00e9/\u65e5\u672c.md"), undefined);
+});
